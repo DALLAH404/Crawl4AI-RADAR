@@ -1,0 +1,773 @@
+# Radar Aftermarket — Source Catalog
+# Auto-generated port of getFontes_() from codigo.gs.
+# ~70+ automotive aftermarket sources for the Brazilian market.
+#
+# Each source:
+#   source_id:   stable slug (auto-generated from name if omitted)
+#   name:        display name
+#   source_type: portal | entidade | concorrente | tema | tecnologia | economia | lancamento
+#   tag:         competitor / entity tag
+#   product_line: default product line
+#   category:    auto | economia | tecnologia
+#   feed_type:   rss_direct | google_news_query | linkedin_company
+#                (auto-detected as rss_direct from rss_url presence; must be
+#                set explicitly for linkedin_company — see below)
+#   rss_url:     (optional) direct RSS feed URL
+#   query_text:  (optional) Google News search query; for feed_type
+#                linkedin_company, the LinkedIn company slug instead
+#                (e.g. "bosch", or "showcase/mahle-aftermarket-parts" for a
+#                LinkedIn Showcase page)
+#   active:      true | false
+
+sources:
+  # ========== Portais Setoriais ==========
+  - name: "Automotive Business"
+    source_type: portal
+    tag: "Mercado"
+    product_line: "Geral"
+    category: auto
+    query_text: '"Automotive Business" autopeças OR montadora'
+
+  - name: "AutoData"
+    source_type: portal
+    tag: "Mercado"
+    product_line: "Geral"
+    category: auto
+    rss_url: "https://autodata.com.br/feed/"
+
+  - name: "Oficina Brasil"
+    source_type: portal
+    tag: "Mercado"
+    product_line: "Geral"
+    category: auto
+    query_text: '"Oficina Brasil" reparação automotiva'
+
+  - name: "Novo Varejo"
+    source_type: portal
+    tag: "Mercado"
+    product_line: "Geral"
+    category: auto
+    rss_url: "https://novovarejo.com.br/feed/"
+
+  - name: "Mercado Automotivo"
+    source_type: portal
+    tag: "Mercado"
+    product_line: "Geral"
+    category: auto
+    rss_url: "https://www.mercadoautomotivo.com.br/feed/"
+
+  - name: "Revista O Mecânico"
+    source_type: portal
+    tag: "Mercado"
+    product_line: "Geral"
+    category: auto
+    rss_url: "https://omecanico.com.br/feed/"
+
+  - name: "Balcão Automotivo"
+    source_type: portal
+    tag: "Mercado"
+    product_line: "Geral"
+    category: auto
+    query_text: '"Balcão Automotivo" autopeças'
+
+  # ========== Entidades ==========
+  - name: "Sindipeças"
+    source_type: entidade
+    tag: "Sindipeças"
+    product_line: "Geral"
+    category: auto
+    query_text: "Sindipeças"
+
+  - name: "Andap"
+    source_type: entidade
+    tag: "Andap"
+    product_line: "Geral"
+    category: auto
+    query_text: "Andap distribuição autopeças"
+
+  - name: "Sindirepa"
+    source_type: entidade
+    tag: "Sindirepa"
+    product_line: "Geral"
+    category: auto
+    query_text: "Sindirepa"
+
+  - name: "Automec"
+    source_type: entidade
+    tag: "Automec"
+    product_line: "Geral"
+    category: auto
+    query_text: "Automec autopeças"
+
+  # ========== Concorrentes P1 ==========
+  - name: "Bosch"
+    source_type: concorrente
+    tag: "Bosch"
+    product_line: "Elétrica"
+    category: auto
+    query_text: "Bosch autopeças OR aftermarket Brasil"
+
+  - name: "ZF Aftermarket"
+    source_type: concorrente
+    tag: "ZF"
+    product_line: "Transmissão"
+    category: auto
+    query_text: '"ZF Aftermarket" OR Sachs embreagem Brasil'
+
+  - name: "Schaeffler"
+    source_type: concorrente
+    tag: "Schaeffler"
+    product_line: "Transmissão"
+    category: auto
+    query_text: "Schaeffler OR LuK Brasil autopeças"
+
+  - name: "MAHLE"
+    source_type: concorrente
+    tag: "MAHLE"
+    product_line: "Motor"
+    category: auto
+    query_text: "MAHLE Brasil"
+
+  - name: "Denso"
+    source_type: concorrente
+    tag: "Denso"
+    product_line: "Sistemas Térmicos"
+    category: auto
+    query_text: "Denso Brasil automotivo"
+
+  - name: "Marelli"
+    source_type: concorrente
+    tag: "Marelli"
+    product_line: "Iluminação"
+    category: auto
+    query_text: 'Marelli OR "Magneti Marelli" OR Cofap'
+
+  - name: "Fras-le"
+    source_type: concorrente
+    tag: "Fras-le"
+    product_line: "Freios"
+    category: auto
+    query_text: 'Fras-le OR "Frasle Mobility"'
+
+  - name: "Nakata"
+    source_type: concorrente
+    tag: "Nakata"
+    product_line: "Suspensão"
+    category: auto
+    query_text: "Nakata autopeças"
+
+  - name: "Fortbras"
+    source_type: concorrente
+    tag: "Fortbras"
+    product_line: "Distribuição"
+    category: auto
+    query_text: "Fortbras"
+
+  # ========== Concorrentes P2/P3 ==========
+  - name: "Continental"
+    source_type: concorrente
+    tag: "Continental"
+    product_line: "Freios"
+    category: auto
+    query_text: "Continental ATE OR VDO autopeças Brasil"
+
+  - name: "Tenneco/DRiV"
+    source_type: concorrente
+    tag: "Tenneco"
+    product_line: "Suspensão"
+    category: auto
+    query_text: "Tenneco OR Monroe OR DRiV Brasil"
+
+  - name: "BorgWarner"
+    source_type: concorrente
+    tag: "BorgWarner"
+    product_line: "Motor"
+    category: auto
+    query_text: "BorgWarner OR Delphi aftermarket"
+
+  - name: "Forvia Hella"
+    source_type: concorrente
+    tag: "Hella"
+    product_line: "Iluminação"
+    category: auto
+    query_text: "Hella OR Forvia iluminação automotiva"
+
+  - name: "Osram"
+    source_type: concorrente
+    tag: "Osram"
+    product_line: "Iluminação"
+    category: auto
+    query_text: "Osram automotivo Brasil"
+
+  - name: "Philips"
+    source_type: concorrente
+    tag: "Philips"
+    product_line: "Iluminação"
+    category: auto
+    query_text: "Philips iluminação automotiva OR Lumileds"
+
+  - name: "NGK"
+    source_type: concorrente
+    tag: "NGK"
+    product_line: "Injeção"
+    category: auto
+    query_text: "NGK Brasil velas OR Niterra"
+
+  - name: "SKF"
+    source_type: concorrente
+    tag: "SKF"
+    product_line: "Motor"
+    category: auto
+    query_text: "SKF Brasil automotivo"
+
+  - name: "MANN+HUMMEL"
+    source_type: concorrente
+    tag: "MANN+HUMMEL"
+    product_line: "Filtros"
+    category: auto
+    query_text: '"MANN+HUMMEL" OR "Mann Hummel" Brasil'
+
+  - name: "Tecfil"
+    source_type: concorrente
+    tag: "Tecfil"
+    product_line: "Filtros"
+    category: auto
+    query_text: "Tecfil filtros"
+
+  - name: "Wega"
+    source_type: concorrente
+    tag: "Wega"
+    product_line: "Filtros"
+    category: auto
+    query_text: "Wega filtros automotivos"
+
+  - name: "Dayco"
+    source_type: concorrente
+    tag: "Dayco"
+    product_line: "Motor"
+    category: auto
+    query_text: "Dayco Brasil"
+
+  - name: "Gates"
+    source_type: concorrente
+    tag: "Gates"
+    product_line: "Motor"
+    category: auto
+    query_text: "Gates correias Brasil"
+
+  - name: "Sabó"
+    source_type: concorrente
+    tag: "Sabó"
+    product_line: "Motor"
+    category: auto
+    query_text: "Sabó autopeças"
+
+  - name: "Exedy"
+    source_type: concorrente
+    tag: "Exedy"
+    product_line: "Transmissão"
+    category: auto
+    query_text: "Exedy embreagem"
+
+  - name: "Trico"
+    source_type: concorrente
+    tag: "Trico"
+    product_line: "Palhetas"
+    category: auto
+    query_text: "Trico palhetas"
+
+  - name: "Arteb"
+    source_type: concorrente
+    tag: "Arteb"
+    product_line: "Iluminação"
+    category: auto
+    query_text: "Arteb iluminação"
+
+  - name: "Shocklight"
+    source_type: concorrente
+    tag: "Shocklight"
+    product_line: "Iluminação"
+    category: auto
+    query_text: "Shocklight"
+
+  - name: "Eaton"
+    source_type: concorrente
+    tag: "Eaton"
+    product_line: "Transmissão"
+    category: auto
+    query_text: 'Eaton embreagem OR "válvula" Brasil'
+
+  # ========== Distribuição / Varejo ==========
+  - name: "SK Automotive"
+    source_type: concorrente
+    tag: "SK Automotive"
+    product_line: "Distribuição"
+    category: auto
+    query_text: '"SK Automotive" distribuidora'
+
+  - name: "Laguna"
+    source_type: concorrente
+    tag: "Laguna"
+    product_line: "Distribuição"
+    category: auto
+    query_text: "Laguna autopeças distribuidora"
+
+  - name: "Pellegrino"
+    source_type: concorrente
+    tag: "Pellegrino"
+    product_line: "Distribuição"
+    category: auto
+    query_text: "Pellegrino distribuidora autopeças"
+
+  - name: "DPK"
+    source_type: concorrente
+    tag: "DPK"
+    product_line: "Distribuição"
+    category: auto
+    query_text: "DPK distribuidora autopeças"
+
+  - name: "GPC/PitStop"
+    source_type: concorrente
+    tag: "GPC"
+    product_line: "Distribuição"
+    category: auto
+    query_text: '"Grupo Pitstop" OR "GPC Brasil" autopeças'
+
+  # ========== Temas Transversais ==========
+  - name: "Aftermarket BR"
+    source_type: tema
+    tag: "Mercado"
+    product_line: "Geral"
+    category: auto
+    query_text: "aftermarket automotivo Brasil"
+
+  - name: "Reposição"
+    source_type: tema
+    tag: "Mercado"
+    product_line: "Geral"
+    category: auto
+    query_text: '"reposição automotiva" OR "mercado de reposição" autopeças'
+
+  - name: "M&A Autopeças"
+    source_type: tema
+    tag: "Mercado"
+    product_line: "Geral"
+    category: auto
+    query_text: "autopeças aquisição OR fusão OR investimento"
+
+  # ========== Tecnologia & IA ==========
+  - name: "IA Automotiva"
+    source_type: tecnologia
+    tag: "Tecnologia"
+    product_line: "Tecnologia"
+    category: tecnologia
+    query_text: "inteligência artificial indústria automotiva"
+
+  - name: "Tech Veicular"
+    source_type: tecnologia
+    tag: "Tecnologia"
+    product_line: "Tecnologia"
+    category: tecnologia
+    query_text: "tecnologia automotiva software veículos"
+
+  - name: "Eletrificação"
+    source_type: tecnologia
+    tag: "Tecnologia"
+    product_line: "Eletrificação"
+    category: tecnologia
+    query_text: "carro elétrico híbrido bateria Brasil"
+
+  - name: "IA Corporativa"
+    source_type: tecnologia
+    tag: "Tecnologia"
+    product_line: "Tecnologia"
+    category: tecnologia
+    query_text: "IA generativa empresas automação Brasil"
+
+  - name: "Indústria 4.0"
+    source_type: tecnologia
+    tag: "Tecnologia"
+    product_line: "Tecnologia"
+    category: tecnologia
+    query_text: "indústria 4.0 manufatura automotiva"
+
+  - name: "Tecnologia Automotiva"
+    source_type: tema
+    tag: "Tecnologia"
+    product_line: "Tecnologia"
+    category: tecnologia
+    query_text: "tecnologia automotiva software veículos conectados"
+
+  - name: "IA & Indústria"
+    source_type: tema
+    tag: "IA"
+    product_line: "Tecnologia"
+    category: tecnologia
+    query_text: "inteligência artificial indústria empresas Brasil"
+
+  - name: "Canaltech"
+    source_type: portal
+    tag: "Tecnologia"
+    product_line: "Tecnologia"
+    category: tecnologia
+    rss_url: "https://canaltech.com.br/rss/"
+
+  - name: "IA Generativa"
+    source_type: tema
+    tag: "IA"
+    product_line: "Tecnologia"
+    category: tecnologia
+    query_text: "IA generativa negócios aplicações"
+
+  # ========== Economia ==========
+  - name: "Câmbio"
+    source_type: economia
+    tag: "Câmbio"
+    product_line: "Câmbio"
+    category: economia
+    query_text: "dólar câmbio real economia"
+
+  - name: "Selic/Copom"
+    source_type: economia
+    tag: "BCB"
+    product_line: "Juros"
+    category: economia
+    query_text: "Selic Copom taxa de juros"
+
+  - name: "Inflação"
+    source_type: economia
+    tag: "IBGE"
+    product_line: "Inflação"
+    category: economia
+    query_text: "IPCA inflação"
+
+  - name: "Anfavea"
+    source_type: economia
+    tag: "Anfavea"
+    product_line: "Indústria"
+    category: economia
+    query_text: "Anfavea produção veículos"
+
+  - name: "Emplacamentos"
+    source_type: economia
+    tag: "Fenabrave"
+    product_line: "Varejo"
+    category: economia
+    query_text: "Fenabrave emplacamentos veículos"
+
+  - name: "Setor Auto Econ."
+    source_type: economia
+    tag: "Mercado"
+    product_line: "Indústria"
+    category: economia
+    query_text: "indústria automotiva Brasil economia investimento"
+
+  - name: "Comércio Ext."
+    source_type: economia
+    tag: "Mercado"
+    product_line: "Comércio"
+    category: economia
+    query_text: "autopeças importação OR exportação balança"
+
+  # ========== Lançamentos de Produtos ==========
+  - name: "Bosch · Lançamento"
+    source_type: lancamento
+    tag: "Bosch"
+    product_line: "Elétrica"
+    category: auto
+    query_text: 'Bosch autopeças (lança OR lançamento OR "nova linha" OR "novo produto")'
+
+  - name: "ZF/Sachs · Lançamento"
+    source_type: lancamento
+    tag: "ZF"
+    product_line: "Transmissão"
+    category: auto
+    query_text: '("ZF Aftermarket" OR Sachs OR "TRW") (lança OR lançamento OR "nova linha")'
+
+  - name: "Schaeffler/LuK · Lançamento"
+    source_type: lancamento
+    tag: "Schaeffler"
+    product_line: "Transmissão"
+    category: auto
+    query_text: "(Schaeffler OR LuK OR INA OR FAG) (lança OR lançamento OR \"nova linha\" OR apresenta OR amplia)"
+
+  - name: "MAHLE · Lançamento"
+    source_type: lancamento
+    tag: "MAHLE"
+    product_line: "Motor"
+    category: auto
+    query_text: 'MAHLE (lança OR lançamento OR "nova linha" OR "novo produto")'
+
+  - name: "Denso · Lançamento"
+    source_type: lancamento
+    tag: "Denso"
+    product_line: "Sistemas Térmicos"
+    category: auto
+    query_text: 'Denso automotivo (lança OR lançamento OR "nova linha")'
+
+  - name: "Marelli/Cofap · Lançamento"
+    source_type: lancamento
+    tag: "Marelli"
+    product_line: "Iluminação"
+    category: auto
+    query_text: '(Cofap OR "Magneti Marelli") (lança OR lançamento OR "nova linha" OR amplia)'
+
+  - name: "Fras-le · Lançamento"
+    source_type: lancamento
+    tag: "Fras-le"
+    product_line: "Freios"
+    category: auto
+    query_text: "(Fras-le OR Frasle OR Lonaflex OR Controil) (lança OR lançamento OR \"nova linha\" OR amplia)"
+
+  - name: "Nakata · Lançamento"
+    source_type: lancamento
+    tag: "Nakata"
+    product_line: "Suspensão"
+    category: auto
+    query_text: 'Nakata (lança OR lançamento OR "nova linha" OR amplia)'
+
+  - name: "Continental/ATE · Lançamento"
+    source_type: lancamento
+    tag: "Continental"
+    product_line: "Freios"
+    category: auto
+    query_text: '(ATE OR VDO OR "Continental Aftermarket") (lança OR lançamento OR "nova linha")'
+
+  - name: "Tenneco/Monroe · Lançamento"
+    source_type: lancamento
+    tag: "Tenneco"
+    product_line: "Suspensão"
+    category: auto
+    query_text: '(Tenneco OR Monroe OR "DRiV") (lança OR lançamento OR "nova linha")'
+
+  - name: "BorgWarner/Delphi · Lançamento"
+    source_type: lancamento
+    tag: "BorgWarner"
+    product_line: "Motor"
+    category: auto
+    query_text: '(BorgWarner OR "Delphi" OR PHINIA) aftermarket (lança OR lançamento OR "nova linha")'
+
+  - name: "Hella/Forvia · Lançamento"
+    source_type: lancamento
+    tag: "Hella"
+    product_line: "Iluminação"
+    category: auto
+    query_text: 'Hella (lança OR lançamento OR "nova linha") automotivo'
+
+  - name: "Osram · Lançamento"
+    source_type: lancamento
+    tag: "Osram"
+    product_line: "Iluminação"
+    category: auto
+    query_text: '(Osram OR "Osram automotive") (lança OR lançamento OR "nova linha" OR apresenta OR lâmpada)'
+
+  - name: "Philips · Lançamento"
+    source_type: lancamento
+    tag: "Philips"
+    product_line: "Iluminação"
+    category: auto
+    query_text: "Philips automotiva (lâmpada OR farol OR iluminação) (lança OR lançamento OR nova OR apresenta)"
+
+  - name: "NGK/Niterra · Lançamento"
+    source_type: lancamento
+    tag: "NGK"
+    product_line: "Injeção"
+    category: auto
+    query_text: '(NGK OR NTK OR Niterra) (lança OR lançamento OR "nova linha" OR apresenta OR "nova gama" OR amplia)'
+
+  - name: "SKF · Lançamento"
+    source_type: lancamento
+    tag: "SKF"
+    product_line: "Motor"
+    category: auto
+    query_text: 'SKF automotivo (lança OR lançamento OR "nova linha" OR "novo kit")'
+
+  - name: "MANN+HUMMEL · Lançamento"
+    source_type: lancamento
+    tag: "MANN+HUMMEL"
+    product_line: "Filtros"
+    category: auto
+    query_text: '("MANN-FILTER" OR "MANN+HUMMEL" OR "Mann Hummel") (lança OR lançamento OR "nova linha")'
+
+  - name: "Tecfil · Lançamento"
+    source_type: lancamento
+    tag: "Tecfil"
+    product_line: "Filtros"
+    category: auto
+    query_text: 'Tecfil (lança OR lançamento OR "nova linha" OR amplia OR "novo filtro" OR apresenta OR "novos filtros")'
+
+  - name: "Wega · Lançamento"
+    source_type: lancamento
+    tag: "Wega"
+    product_line: "Filtros"
+    category: auto
+    query_text: 'Wega (filtro OR filtros) (lança OR lançamento OR "nova linha" OR amplia)'
+
+  - name: "Dayco · Lançamento"
+    source_type: lancamento
+    tag: "Dayco"
+    product_line: "Motor"
+    category: auto
+    query_text: 'Dayco (lança OR lançamento OR "nova linha" OR amplia OR "novo kit")'
+
+  - name: "Gates · Lançamento"
+    source_type: lancamento
+    tag: "Gates"
+    product_line: "Motor"
+    category: auto
+    query_text: 'Gates (correia OR tensor OR kit) (lança OR lançamento OR "nova linha")'
+
+  - name: "Sabó · Lançamento"
+    source_type: lancamento
+    tag: "Sabó"
+    product_line: "Motor"
+    category: auto
+    query_text: 'Sabó (lança OR lançamento OR "nova linha" OR amplia)'
+
+  - name: "Exedy · Lançamento"
+    source_type: lancamento
+    tag: "Exedy"
+    product_line: "Transmissão"
+    category: auto
+    query_text: 'Exedy (lança OR lançamento OR "nova linha" OR apresenta OR embreagem OR "novo kit")'
+
+  - name: "Trico · Lançamento"
+    source_type: lancamento
+    tag: "Trico"
+    product_line: "Palhetas"
+    category: auto
+    query_text: 'Trico (palheta OR limpador OR "palhetas") (lança OR lançamento OR nova OR apresenta OR amplia)'
+
+  - name: "Arteb · Lançamento"
+    source_type: lancamento
+    tag: "Arteb"
+    product_line: "Iluminação"
+    category: auto
+    query_text: "Arteb (farol OR lanterna OR iluminação) (lança OR lançamento OR nova OR apresenta OR amplia)"
+
+  - name: "Eaton · Lançamento"
+    source_type: lancamento
+    tag: "Eaton"
+    product_line: "Transmissão"
+    category: auto
+    query_text: 'Eaton (embreagem OR "válvula") (lança OR lançamento OR "nova linha" OR amplia)'
+
+  - name: "Rolamentos · Lançamento"
+    source_type: lancamento
+    tag: "Mercado"
+    product_line: "Motor"
+    category: auto
+    query_text: '(NSK OR Timken OR Koyo OR SKF) rolamento automotivo (lança OR lançamento OR "nova linha")'
+
+  # ========== LinkedIn (concorrentes) ==========
+  # Company-page slugs verified against LinkedIn before inclusion — plain
+  # `nakata` and `controil` resolve to unrelated small companies, not the
+  # intended brands, so the confirmed slugs below are used instead. ZF
+  # Aftermarket and Niterra/NGK have no distinct public LinkedIn page under
+  # any guessed slug, so they're omitted rather than guessed; Controil,
+  # Lonaflex and DRiV fall back to their parent companies (Randon/Fras-le,
+  # Tenneco), already covered below. See scripts/linkedin_radar.py for the
+  # original research behind this list.
+  - name: "Valeo · LinkedIn"
+    source_type: concorrente
+    tag: "Valeo"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "valeo"
+
+  - name: "Bosch · LinkedIn"
+    source_type: concorrente
+    tag: "Bosch"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "bosch"  # Bosch (Mobility Aftermarket)
+
+  - name: "ZF · LinkedIn"
+    source_type: concorrente
+    tag: "ZF"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "zf-group"  # ZF (Sachs, TRW, Lemförder, Wabco) — main page, no dedicated "ZF Aftermarket" page found
+
+  - name: "MAHLE · LinkedIn"
+    source_type: concorrente
+    tag: "MAHLE"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "mahle"  # MAHLE Aftermarket
+
+  - name: "Marelli · LinkedIn"
+    source_type: concorrente
+    tag: "Marelli"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "magneti-marelli-parts-and-services"  # Magneti Marelli (now Marelli)
+
+  - name: "Schaeffler · LinkedIn"
+    source_type: concorrente
+    tag: "Schaeffler"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "schaeffler"  # Schaeffler (LuK, INA, FAG)
+
+  - name: "Tenneco · LinkedIn"
+    source_type: concorrente
+    tag: "Tenneco"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "tenneco"  # Tenneco (Monroe, DRiV)
+
+  - name: "Continental · LinkedIn"
+    source_type: concorrente
+    tag: "Continental"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "continental"  # Continental (ATE, VDO) — main page, no dedicated aftermarket page found
+
+  - name: "Denso · LinkedIn"
+    source_type: concorrente
+    tag: "Denso"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "densopartseu"  # Denso — main page, no dedicated "Denso Aftermarket" page found
+
+  - name: "SKF · LinkedIn"
+    source_type: concorrente
+    tag: "SKF"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "skf"  # SKF — main page, no dedicated "SKF Automotive" page found
+
+  - name: "Nakata · LinkedIn"
+    source_type: concorrente
+    tag: "Nakata"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "nakata-uk"
+
+  - name: "Fras-le · LinkedIn"
+    source_type: concorrente
+    tag: "Fras-le"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "frasleuk"
+
+  - name: "Randon · LinkedIn"
+    source_type: concorrente
+    tag: "Randon"
+    product_line: "Geral"
+    category: auto
+    feed_type: linkedin_company
+    query_text: "randon"  # Randoncorp (Controil, Lonaflex)

@@ -1,0 +1,130 @@
+# Default crawl configuration for the ai-crawling-pipeline.
+#
+# Sections:
+#   browser:   BrowserConfig kwargs (headless, viewport, etc.)
+#   defaults:  CrawlerRunConfig kwargs applied to every target
+#   output:    Where markdown files are written
+#   targets:   List of sites to crawl. Per-target keys override `defaults`.
+
+browser:
+  headless: true
+  viewport_width: 1280
+  viewport_height: 800
+
+# Anti-blocking / retry configuration.
+# When a response looks blocked (status 403/429/503, captcha markers, very short content)
+# the crawler rotates the user-agent and retries with exponential backoff.
+anti_block:
+  enabled: true
+  max_retries: 3
+  backoff_seconds: 2.0
+  jitter_seconds: 0.5
+  rotate_user_agent: true
+  magic: true                   # crawl4ai CrawlerRunConfig.magic
+  enable_stealth: true          # crawl4ai BrowserConfig.enable_stealth
+  min_content_chars: 200
+  block_status_codes: [403, 429, 503]
+  block_indicators:
+    - "access denied"
+    - "captcha"
+    - "cf-ray id"
+    - "cloudflare ray"
+    - "just a moment"
+    - "please verify you are a human"
+    - "checking your browser before accessing"
+    - "attention required! please complete the verification"
+    - "bot detection"
+  user_agents:
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15"
+    - "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+defaults:
+  cache_mode: bypass            # one of: enabled, bypass, disabled, read_only, write_only
+  remove_overlay_elements: true
+  page_timeout: 60000
+  screenshot: false
+
+output:
+  dir: outputs/raw
+
+summary:
+  input_dir: outputs/raw
+  output_dir: outputs/processed
+  max_input_chars: 20000
+  llm:
+    base_url: https://opencode.ai/zen/go/v1
+    model: deepseek-v4-flash
+    api_key_env: OPENAI_API_KEY
+    temperature: 0.3
+    max_tokens: 4096
+  system_prompt: |
+    Summarize the following web page content into a single concise paragraph
+    (~300 words). Capture the main topic, key entities, and notable facts.
+  user_prompt_template: |
+    {content}
+
+# Dedup / filteration stage. Runs between crawl and summarize and stores its
+# state in a local SQLite database with sqlite-vec for embedding KNN.
+# The summarizer only sees items marked status='new'; duplicates are skipped.
+dedup:
+  db_path: outputs/dedup.db
+  input_dir: outputs/raw
+  title_window_hours: 72
+  jaccard_window_hours: 24
+  jaccard_threshold: 0.4
+  embedding_window_hours: 72
+  embedding_threshold: 0.85
+  embedding_ambiguity_low: 0.75
+  embedding_ambiguity_high: 0.85
+  embedding_top_k: 10
+  embedding:
+    provider: gemini
+    model: models/gemini-embedding-001
+    dim: 768
+    api_key_env: GEMINI_API_KEY
+    task_type: RETRIEVAL_DOCUMENT
+  llm:
+    base_url: https://opencode.ai/zen/go/v1
+    model: deepseek-v4-flash
+    api_key_env: OPENAI_API_KEY
+    temperature: 0.0
+    max_tokens: 16
+  judge_system_prompt: |
+    You are a deduplication judge. Given two page titles and short content
+    excerpts, decide if they describe the same specific event, different
+    events, or are merely related. Respond with exactly one of: same,
+    different, related.
+
+targets:
+  - slug: books_toscrape
+    url: https://books.toscrape.com/
+    wait_for: "css:.product_pod"
+
+  - slug: quotes_toscrape_js
+    url: https://quotes.toscrape.com/js/
+    wait_for: "css:.quote"
+
+  - slug: quotes_toscrape_login
+    url: https://quotes.toscrape.com/
+    wait_for: "css:.quote"
+    session_id: quotes_session
+    js_code: |
+      document.querySelector('#username').value = 'anyuser';
+      document.querySelector('#password').value = 'anypass';
+      document.querySelector('form').submit();
+
+  - slug: scrapethissite_ajax
+    url: https://scrapethissite.com/pages/ajax-javascript/#2010
+    wait_for: "css:.film"
+
+  - slug: sandbox_oxylabs
+    url: https://sandbox.oxylabs.io/
+    wait_for: "css:body"
+
+  - slug: huggingface_pricing
+    url: https://huggingface.co/pricing
+
+  - slug: bosch_appliied_math_blog
+    url: https://www.bosch.com/stories/applied-mathematics/

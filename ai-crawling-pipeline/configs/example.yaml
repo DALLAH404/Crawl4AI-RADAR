@@ -1,0 +1,113 @@
+# Example showing every supported field. Copy and edit.
+# Run with:  uv run ai-crawling-pipeline configs/example.yaml
+
+browser:
+  headless: true
+  viewport_width: 1280
+  viewport_height: 800
+  # user_agent: "Mozilla/5.0 ..."
+  # proxy_config:
+  #   server: http://proxy:8080
+  #   username: user
+  #   password: pass
+
+# Global anti-block defaults. Each target can override any subset.
+anti_block:
+  enabled: true
+  max_retries: 3
+  backoff_seconds: 2.0
+  jitter_seconds: 0.5
+  rotate_user_agent: true
+  magic: true
+  enable_stealth: true
+  min_content_chars: 200
+  block_status_codes: [403, 429, 503]
+  block_indicators:
+    - "access denied"
+    - "captcha"
+    - "cf-ray id"
+    - "cloudflare ray"
+  user_agents:
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15"
+
+defaults:
+  cache_mode: bypass            # enabled | bypass | disabled | read_only | write_only
+  remove_overlay_elements: true
+  page_timeout: 60000
+  screenshot: false
+  # wait_for_timeout: 30000     # optional override; falls back to page_timeout
+  # excluded_tags: ["nav", "footer"]
+  # css_selector: ".main-content"
+
+output:
+  dir: outputs/raw
+
+# Optional dedup/filteration stage. See README for the full description.
+dedup:
+  db_path: outputs/dedup.db
+  input_dir: outputs/raw
+  title_window_hours: 72
+  jaccard_window_hours: 24
+  jaccard_threshold: 0.4
+  embedding_window_hours: 72
+  embedding_threshold: 0.85
+  embedding_ambiguity_low: 0.75
+  embedding_ambiguity_high: 0.85
+  embedding_top_k: 10
+  embedding:
+    provider: gemini
+    model: models/gemini-embedding-001
+    dim: 768
+    api_key_env: GEMINI_API_KEY
+    task_type: RETRIEVAL_DOCUMENT
+  llm:
+    base_url: https://opencode.ai/zen/go/v1
+    model: deepseek-v4-flash
+    api_key_env: OPENAI_API_KEY
+    temperature: 0.0
+    max_tokens: 16
+  judge_system_prompt: |
+    You are a deduplication judge. Given two page titles and short content
+    excerpts, decide if they describe the same specific event, different
+    events, or are merely related. Respond with exactly one of: same,
+    different, related.
+
+targets:
+  - slug: simple_page
+    url: https://example.com/
+
+  - slug: js_rendered
+    url: https://example.com/dynamic
+    wait_for: "css:.loaded"
+    # wait_for accepts: "css:selector", "js:expression", or a callable name
+    js_code: |
+      window.scrollTo(0, document.body.scrollHeight);
+
+  - slug: requires_login
+    url: https://example.com/dashboard
+    session_id: example_session
+    wait_for: "css:.dashboard"
+    js_code: |
+      document.querySelector('#username').value = 'anyuser';
+      document.querySelector('#password').value = 'anypass';
+      document.querySelector('form').submit();
+
+  - slug: slow_site
+    url: https://example.com/heavy
+    page_timeout: 120000
+    wait_for: "css:body"
+
+  # Per-target override: disable anti-block for a known-friendly site.
+  - slug: friendly_site
+    url: https://example.com/friendly
+    anti_block:
+      enabled: false
+
+  # Per-target override: aggressive retry policy for a known-bot-detected site.
+  - slug: tough_target
+    url: https://example.com/tough
+    anti_block:
+      max_retries: 5
+      backoff_seconds: 5.0
+      magic: false  # magic and stealth can conflict on some sites

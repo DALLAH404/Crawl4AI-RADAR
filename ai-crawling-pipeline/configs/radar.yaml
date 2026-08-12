@@ -1,0 +1,125 @@
+# Radar Aftermarket Pipeline — sample configuration.
+#
+# Stages: collect (RSS/Google News) → fetch (Crawl4AI) → dedup → summarize.
+# Run with:  uv run radar-pipeline --config configs/radar.yaml [--stage...]
+# Default:  collect → fetch → dedup → summarize
+
+db:
+  path: outputs/radar/radar.db
+  embedding_dim: 768
+
+collect:
+  concurrency: 8
+  max_items_per_feed: 25
+  backfill_max_items: 100
+  days_back: 30
+  backfill_days: 90
+  # Politeness / resilience knobs for outbound HTTP (see
+  # radar_pipeline/sources/ratelimit.py). Tuned to keep news.google.com
+  # happy — going harder than this re-triggers the "Sorry..." block.
+  gnews_concurrency: 2          # in-flight requests against news.google.com
+  request_delay_seconds: 0.25    # min spacing between requests on the same host
+  request_jitter_seconds: 0.25   # uniform jitter added on top of the delay
+  block_cooldown_seconds: 60.0   # fail-fast window after a 429/5xx
+  fetch_max_retries: 3           # retries on 429/5xx before raising FeedFetchError
+  fetch_backoff_seconds: 2.0     # base for exponential backoff between retries
+  linkedin:
+    enabled: true
+    days: 7                    # keep posts estimated within N days
+    concurrency: 1              # companies in flight (LinkedIn blocks parallel access)
+    delay_seconds: 8.0          # min spacing between company page fetches
+    jitter_seconds: 2.0
+    block_retries: 1            # extra attempts for a blocked company
+    block_retry_delay: 90.0
+    block_cooldown_seconds: 60.0
+    page_timeout_ms: 30000
+    include_media: true         # costs a 2nd scrolled page load per company
+    max_posts_per_company: 25
+    headless: true
+
+fetch:
+  output_dir: outputs/radar/raw
+  browser:
+    headless: true
+    viewport_width: 1280
+    viewport_height: 800
+  defaults:
+    cache_mode: bypass
+    remove_overlay_elements: true
+    page_timeout: 60000
+    screenshot: false
+  anti_block:
+    enabled: true
+    max_retries: 3
+    backoff_seconds: 2.0
+    jitter_seconds: 0.5
+    rotate_user_agent: true
+    magic: true
+    enable_stealth: true
+    min_content_chars: 200
+    block_status_codes: [403, 429, 503]
+    block_indicators:
+      - "access denied"
+      - "captcha"
+      - "cf-ray id"
+      - "cloudflare ray"
+      - "just a moment"
+
+dedup:
+  title_window_hours: 72
+  jaccard_window_hours: 24
+  jaccard_threshold: 0.4
+  embedding_window_hours: 72
+  embedding_threshold: 0.85
+  ambiguity_low: 0.75
+  ambiguity_high: 0.85
+  top_k: 10
+  use_hybrid_fts5: true
+  gemini_embedding:
+    model: models/gemini-embedding-001
+    dim: 768
+    api_key_env: GEMINI_API_KEY
+    task_type: RETRIEVAL_DOCUMENT
+  judge_llm:
+    base_url: https://opencode.ai/zen/go/v1
+    model: deepseek-v4-flash
+    api_key_env: OPENAI_API_KEY
+    temperature: 0.0
+    max_tokens: 16
+  judge_system_prompt: |
+    You are a deduplication judge. Given two page titles and short content
+    excerpts, decide if they describe the same specific event, different
+    events, or are merely related. Respond with exactly one of: same,
+    different, related.
+
+summarize:
+  output_dir: outputs/radar/processed
+  concurrency: 8
+  max_input_chars: 20000
+  llm:
+    base_url: https://opencode.ai/zen/go/v1
+    model: deepseek-v4-flash
+    api_key_env: OPENAI_API_KEY
+    temperature: 0.3
+    max_tokens: 4096
+  system_prompt: |
+    You are a market-intelligence analyst for the Brazilian automotive
+    aftermarket. Summarize the article in a single paragraph (max 900 chars)
+    and assess its competitive relevance.
+    Your response must be valid JSON with these keys exactly:
+      "summary": concise paragraph in English capturing the key business event
+        and its relevance to the automotive aftermarket.
+      "competitor_analysis": if the article mentions a specific competitor
+        action (launch, acquisition, expansion...), describe the competitive
+        impact in 1-2 sentences, otherwise empty string.
+      "event_type": one of [Lancamento, Evento, Institucional, M&A, Preco,
+        Investimento, Distribuicao, Executivos, Indicador, Atualizacao].
+      "alert_level": one of [Alto, Medio, Baixo].
+      "relevant": true if the article is about automotive aftermarket /
+        replacement parts / competitor actions, false if it is a generic
+        corporate PR piece not about aftermarket.
+    Respond ONLY with the JSON object, no markdown fences.
+
+sources:
+  yaml_path: configs/radar_sources.yaml
+  auto_seed: true
