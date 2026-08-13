@@ -559,32 +559,54 @@ browser_kwargs.setdefault("headless", True); BrowserConfig(**browser_kwargs)`.
 The YAML can still override `headless` if it wants; the explicit default only
 fires when the YAML omits the key.
 
-### Bracket access on optional article fields — `KeyError` in fetch
+### Missing keys on empty fields — `KeyError` in fetch *and* summarize
 
 **Symptom**: `fetch/crawl.py` did `article["event_type"] or ""` (and the same for
 `category`, `competitor_tag`, `product_line`, `alert_level`, `source_id`) — caught by
-`_fetch_one`'s blanket `except Exception`, so it never crashed the task, but it
-silently turned every article whose `event_type` (or any of those other fields)
-happened to be empty into a counted `failed` fetch, no markdown written, no
-`image_url` update. `classify_article` returning `""` when no keyword rule matches is
-completely normal, so this was live and firing on a meaningful fraction of real
-articles, not a rare edge case.
+`_fetch_one`'s blanket `except Exception`, so every article whose `event_type` (or
+any of those other fields) happened to be empty was silently counted as a `failed`
+fetch instead of crashing loudly. Worse, and found *after* that fix had already
+shipped: `summarize/pipeline.py` did the same thing with `article["summary"]` —
+`if article["summary"]:` — and that one wasn't caught by any per-article exception
+handler, so it took down the *entire* summarize stage on the very first real run:
+every pending article had never been summarized (`summary=""`, the untouched
+default), `run_summarize` raised `KeyError('summary')` immediately, and the run ended
+with `"Pipeline failed", "error": "'summary'"` in the logs — every article stayed
+`pending` forever, nothing summarized, no retry (this is *not* the same as the
+`--retry-failed` case: these articles were never marked `failed`, they just never got
+attempted).
 
 **Cause**: under SQLite, every column was always present on a row, empty string or
-not — `row["event_type"]` was always safe. `db._base_item()` strips empty-string
-attributes before storing an item (`{k: v for k, v in item.items() if v not in (None,
-"")}` — no reason to store an empty attribute), so a DynamoDB item is *missing* the
-key entirely when that field is `""`, not carrying an empty value for it. Bracket
-access assumes the key exists; `.get()` doesn't. This was found via a test written
-for the S3 upload path (`test_fetch_crawl_s3.py`) — the first test to actually
-exercise `fetch_articles`'s LinkedIn short-circuit branch end to end with a realistic
-article missing an optional field.
+not — `row["field"]` was always safe. `db._base_item()` strips empty-string
+attributes before storing an item (no reason to store an empty attribute), so a
+DynamoDB item is *missing* the key entirely when that field is `""`, not carrying an
+empty value for it. Bracket access assumes the key exists.
 
-**Fix**: every optional field read in `_fetch_one` uses `article.get(field) or
-default` now, not `article[field] or default`. `article_hash`/`title`/`link` stay as
-bracket access deliberately — those should never legitimately be absent, and a
-`KeyError` there would mean a real data-integrity problem worth surfacing loudly, not
-papering over.
+**First fix attempt (incomplete)**: patched `fetch/crawl.py`'s bracket accesses to
+`.get(field) or default`. This worked, but was call-site-by-call-site — and
+`summarize/pipeline.py` had the exact same pattern, missed in that pass, which is
+what actually broke a real run.
+
+**Real fix**: instead of auditing every caller for `.get()` discipline (already
+gotten wrong once), `db.py` now guarantees the SQLite-era invariant at the source.
+`_as_full_article(item)` backfills every `Article` field's dataclass default
+(`{**_ARTICLE_DEFAULTS, **_clean(item)}`, where `_ARTICLE_DEFAULTS =
+dataclasses.asdict(Article())`) onto every "full article" read — `get_article`,
+`find_by_article_hash`/`find_by_raw_link` (both call `get_article`),
+`find_by_title_hash_within`, `pending_articles`/`failed_articles`, and
+`latest_articles`. Any caller doing plain bracket access on a returned article dict
+is safe again, for every current field and any future one added to `Article` — no
+per-call-site vigilance required. `articles_for_company(ies)` deliberately does
+**not** get this treatment: its company-link items are an intentionally partial view
+(denormalized display fields only), and backfilling full `Article` defaults onto them
+would fabricate fields that were never real data for that item shape.
+`fetch/crawl.py`'s already-applied `.get()` calls were left in place — harmless,
+now-redundant defense in depth, not reverted.
+
+**Verification**: `tests/radar_pipeline/summarize/test_pipeline.py` reproduces the
+exact scenario (a `put_article`'d article with `summary` never set, run through
+`run_summarize`) — confirmed to fail with the same `KeyError('summary')` when
+`_as_full_article` is reverted to plain `_clean`, and pass with it in place.
 
 ### Empty `article_hash`
 
@@ -805,4 +827,4 @@ uv run python scripts/check_dynamodb_idempotency.py --endpoint-url http://localh
 Tests live in `tests/radar_pipeline/` and run via `uv run pytest
 tests/radar_pipeline/ -q`. The suite covers classify, db (against a moto-mocked
 DynamoDB table — see `conftest.py`), collector (RSS and LinkedIn), fetch/S3 output
-(moto-mocked S3), and the LinkedIn extraction layer (136 tests).
+(moto-mocked S3), summarize, and the LinkedIn extraction layer (138 tests).

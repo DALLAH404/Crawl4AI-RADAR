@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from decimal import Decimal
 from typing import Any
 
@@ -168,6 +168,27 @@ def _md5(text: str) -> str:
 
 def _clean(item: dict) -> dict:
     return {k: v for k, v in item.items() if k not in _INTERNAL_KEYS}
+
+
+# Article() with every field at its dataclass default — computed once, reused
+# by _as_full_article for every "full article" read. `companies()` is a
+# method, not a field, so it's correctly absent here.
+_ARTICLE_DEFAULTS = asdict(Article())
+
+
+def _as_full_article(item: dict) -> dict:
+    """Fill in Article's field defaults for anything DynamoDB doesn't have —
+    empty-string attributes aren't stored (see _base_item), so a pending
+    article that's never been summarized has no 'summary' key at all, not an
+    empty one. Bracket access (article["summary"]) on that raises KeyError;
+    every caller across fetch/dedup/summarize/cli assumed the SQLite-era
+    guarantee that every column always exists, empty or not. Restoring that
+    guarantee here — once, for every full-article read — is more robust than
+    auditing every call site for .get() usage (which already missed two
+    files' worth of call sites once). Company-link items are a deliberately
+    partial view of an article and do NOT go through this — see
+    articles_for_company(ies)."""
+    return {**_ARTICLE_DEFAULTS, **_clean(item)}
 
 
 def _sort_ts(article: Article) -> str:
@@ -322,7 +343,7 @@ def update_article(store: RadarStore, article_hash: str, **changes: Any) -> dict
 def get_article(store: RadarStore, article_hash: str) -> dict | None:
     resp = store.table.get_item(Key={"pk": f"ARTICLE#{article_hash}", "sk": "METADATA"})
     item = resp.get("Item")
-    return _clean(item) if item else None
+    return _as_full_article(item) if item else None
 
 
 def find_by_article_hash(store: RadarStore, article_hash: str, exclude_hash: str | None = None) -> dict | None:
@@ -375,7 +396,7 @@ def find_by_title_hash_within(
             continue
         if item.get("summary_status") == "irrelevant":
             continue
-        return _clean(item)
+        return _as_full_article(item)
     return None
 
 
@@ -397,7 +418,7 @@ def _status_queue(store: RadarStore, status: str, limit: int | None = None) -> l
     items.sort(key=lambda i: i.get("collected_at", ""))
     if limit:
         items = items[:limit]
-    return [_clean(i) for i in items]
+    return [_as_full_article(i) for i in items]
 
 
 def pending_articles(store: RadarStore, limit: int | None = None) -> list[dict]:
@@ -430,7 +451,7 @@ def latest_articles(store: RadarStore, limit: int = 20) -> list[dict]:
         ScanIndexForward=False,
         Limit=limit,
     )
-    return [_clean(i) for i in resp.get("Items", [])]
+    return [_as_full_article(i) for i in resp.get("Items", [])]
 
 
 def articles_for_company(
