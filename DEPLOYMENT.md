@@ -118,5 +118,84 @@ running somewhere with AWS access.
 
 ---
 
-*(Later phases — containerize, task definition/IAM, scheduling, verification, read
-API, frontend — will each add their own section here as they're built.)*
+## Phase 2 — Containerize
+
+The image is built from `ai-crawling-pipeline/` (that's the Docker build context —
+run these commands from that directory). It bundles both `radar_pipeline` and its
+sibling `ai_crawling_pipeline` package (they share one Python distribution), Playwright
++ Chromium (via the `mcr.microsoft.com/playwright/python` base image, pinned to the
+same Playwright version the project depends on), and everything in `requirements.txt`
+(exported from `uv.lock`, so it matches exactly what the test suite runs against).
+
+`radar-pipeline` needs **`AWS_DEFAULT_REGION`** set explicitly wherever it runs —
+confirmed while testing this image locally: this botocore version does not resolve a
+region from `AWS_REGION` alone the way Lambda's runtime does, only from
+`AWS_DEFAULT_REGION` or an explicit `region_name`. Don't forget this in the Phase 3
+task definition's environment variables, or every DynamoDB call will fail with
+`NoRegionError` before it even gets to check credentials.
+
+### Test the image locally (no AWS needed for this part)
+
+```bash
+cd ai-crawling-pipeline
+docker build -t radar-pipeline:local .
+
+# Sanity check that doesn't touch AWS at all — just parses the bundled YAML
+# source catalog:
+docker run --rm --entrypoint radar-pipeline radar-pipeline:local sources-list --active-only
+
+# Confirms the container reaches AWS correctly (expect it to fail on
+# UnrecognizedClientException with these fake credentials — that's the
+# correct failure; it means region + request signing worked and only the
+# credentials themselves are invalid, which real ones from the Phase 3 task
+# role will fix):
+docker run --rm --entrypoint radar-pipeline \
+  -e AWS_DEFAULT_REGION=us-east-1 -e AWS_ACCESS_KEY_ID=test -e AWS_SECRET_ACCESS_KEY=test \
+  radar-pipeline:local --status
+```
+
+To actually run it against your real DynamoDB table from here, swap in real
+credentials (e.g. `-e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... -e
+AWS_SESSION_TOKEN=...` from `aws configure export-credentials` or similar) and a real
+`OPENAI_API_KEY` for `--summarize`.
+
+### Create the ECR repo
+
+**Console**: ECR → **Repositories** → **Create repository**.
+- **Visibility**: Private.
+- **Repository name**: `news-scraper`.
+- Leave **Tag immutability** and **Scan on push** at their defaults (or turn on
+  **Scan on push** if you want vulnerability scanning on every push — optional, no
+  cost impact on the pipeline itself).
+- Everything else default. **Create repository**.
+
+**Confirm it worked**: the repository list shows `news-scraper`; `aws ecr
+describe-repositories --repository-names news-scraper --region <your-region>` returns
+its `repositoryUri`.
+
+**CLI equivalent**:
+
+```bash
+aws ecr create-repository --repository-name news-scraper --region <your-region>
+```
+
+### Push the image
+
+`push_to_ecr.sh` (in `ai-crawling-pipeline/`) builds, authenticates, tags, and pushes.
+Run it yourself from somewhere with AWS access — CloudShell or your own machine, not
+this Codespace:
+
+```bash
+cd ai-crawling-pipeline
+AWS_ACCOUNT_ID=<your-account-id> AWS_REGION=<your-region> ./push_to_ecr.sh
+```
+
+**Confirm it worked**: the script prints the pushed image URI at the end
+(`<account>.dkr.ecr.<region>.amazonaws.com/news-scraper:latest`); `aws ecr
+list-images --repository-name news-scraper --region <your-region>` should list a
+`latest`-tagged image. Keep the printed URI — Phase 3's task definition needs it.
+
+---
+
+*(Later phases — task definition/IAM, scheduling, verification, read API, frontend —
+will each add their own section here as they're built.)*
