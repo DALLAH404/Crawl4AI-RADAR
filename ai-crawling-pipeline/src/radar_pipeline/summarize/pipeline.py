@@ -17,6 +17,7 @@ from radar_pipeline.db import (
     mark_article_failed,
     mark_article_irrelevant,
     pending_articles,
+    update_article,
 )
 from radar_pipeline.summarize.client import summarize_one
 from radar_pipeline.summarize.prompts import DEFAULT_SYSTEM_PROMPT
@@ -26,10 +27,10 @@ logger = logging.getLogger(__name__)
 
 
 async def run_summarize(
-    con,
+    store,
     settings: SummarizeSettings,
 ) -> dict[str, int]:
-    articles = pending_articles(con)
+    articles = pending_articles(store)
     if not articles:
         logger.info("No pending articles to summarize")
         return {"total": 0, "summarized": 0, "irrelevant": 0, "failed": 0}
@@ -59,39 +60,29 @@ async def run_summarize(
             )
 
             if not result.ok:
-                mark_article_failed(con, article["id"], result.error)
+                mark_article_failed(store, article["article_hash"], result.error)
                 failed += 1
-                logger.warning("Summarize failed for article %d: %s", article["id"], result.error)
+                logger.warning("Summarize failed for article %s: %s", article["article_hash"], result.error)
                 return
 
             if not result.relevant:
-                mark_article_irrelevant(con, article["id"])
+                mark_article_irrelevant(store, article["article_hash"])
                 irrelevant += 1
                 return
 
-            con.execute(
-                """UPDATE articles SET
-                    summary = ?,
-                    competitor_analysis = ?,
-                    event_type = ?,
-                    alert_level = ?,
-                    summary_status = 'ai_generated',
-                    ai_model = ?,
-                    ai_processed_at = ?
-                WHERE id = ?""",
-                (
-                    result.summary,
-                    result.competitor_analysis,
-                    result.event_type,
-                    result.alert_level,
-                    settings.llm.model,
-                    now,
-                    article["id"],
-                ),
+            update_article(
+                store,
+                article["article_hash"],
+                summary=result.summary,
+                competitor_analysis=result.competitor_analysis,
+                event_type=result.event_type,
+                alert_level=result.alert_level,
+                summary_status="ai_generated",
+                ai_model=settings.llm.model,
+                ai_processed_at=now,
             )
             write_summary_json(
                 output_dir=settings.output_dir,
-                article_id=article["id"],
                 article_hash=article["article_hash"],
                 source_id=article["source_id"] or "unknown",
                 source_name=article["source_name"] or "",
@@ -113,8 +104,6 @@ async def run_summarize(
 
     tasks = [_process_one(a) for a in articles]
     await asyncio.gather(*tasks)
-
-    con.commit()
 
     return {
         "total": len(articles),

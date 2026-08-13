@@ -36,7 +36,9 @@ class Source:
 
 @dataclass
 class Article:
-    id: int | None = None
+    # Identity is the URL hash (article_hash), not an auto-increment ID —
+    # DynamoDB has no equivalent of SQLite's ROWID, and keying on a value
+    # derived from the article itself is what makes writes idempotent.
     article_hash: str = ""
     title_hash: str = ""
     published_at: str = ""
@@ -60,17 +62,28 @@ class Article:
     ingestion_batch_id: str = ""
     source_id: str = ""
     source_name: str = ""
+    # Denormalized from the source's own feed_type at collect time — with
+    # sources no longer living in a DB table (see catalog.py), this is how
+    # the fetch stage still knows to route linkedin_company rows without a
+    # join.
+    feed_type: str = ""
     dedup_layer: int | None = None
     dedup_decision: str = ""
     dedup_reason: str = ""
-    dedup_match_id: int | None = None
+    dedup_match_hash: str = ""
     dedup_score: float | None = None
     extra: str = ""
+
+    def companies(self) -> list[str]:
+        """Companies this article should be indexed under for the per-company
+        feed. Currently derived from the single `competitor_tag` a source
+        carries; a source that should fan an article out to more than one
+        company can pass a comma-separated tag (e.g. "Bosch,Mahle")."""
+        return [c.strip() for c in self.competitor_tag.split(",") if c.strip()]
 
 
 @dataclass
 class CollectionRun:
-    id: int | None = None
     run_id: str = ""
     source_id: str = ""
     source_name: str = ""
@@ -98,7 +111,7 @@ class DedupResult:
     decision: str
     layer: int | None = None
     reason: str = ""
-    match_id: int | None = None
+    match_hash: str = ""
     score: float | None = None
     embedding: list[float] | None = None
 

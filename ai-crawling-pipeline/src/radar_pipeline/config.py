@@ -27,10 +27,11 @@ class GeminiEmbeddingSettings:
 
 @dataclass
 class DatabaseSettings:
-    path: Path = field(default_factory=lambda: Path("outputs/radar/radar.db"))
-    embedding_dim: int = 768
-    wal_mode: bool = True
-    foreign_keys: bool = True
+    table_name: str = "radar-articles"
+    region_name: str = ""
+    # Set only for local/dev testing (dynamodb-local, moto) — leave empty to
+    # use the real AWS endpoint for the configured region. See db.ensure_table.
+    endpoint_url: str = ""
 
 
 @dataclass
@@ -56,6 +57,15 @@ class CollectSettings:
     backfill_max_items: int = 100
     days_back: int = 30
     backfill_days: int = 90
+    # Fine-grained cutoff for the every-3-hours schedule — when set, this
+    # overrides days_back for normal-mode runs (backfill mode is unaffected
+    # and keeps using backfill_days). None keeps the old day-granularity
+    # behavior.
+    hours_back: int | None = None
+    # Config-driven company scope: which sources' `tag` a run should poll.
+    # Empty means no filter (every active source, same as before this field
+    # existed).
+    companies: list[str] = field(default_factory=list)
     # Politeness & resilience for the collect stage. See
     # radar_pipeline.sources.ratelimit.RateLimiter for semantics.
     gnews_concurrency: int = 2
@@ -111,7 +121,6 @@ class SummarizeSettings:
 @dataclass
 class SourcesSettings:
     yaml_path: Path = field(default_factory=lambda: Path("configs/radar_sources.yaml"))
-    auto_seed: bool = True
 
 
 @dataclass
@@ -181,15 +190,19 @@ def load_radar_config(yaml_path: str | Path) -> RadarConfig:
     sources_r = data.get("sources") or {}
 
     db = DatabaseSettings(
-        path=Path(db_r.get("path", "outputs/radar/radar.db")),
-        embedding_dim=int(db_r.get("embedding_dim", DatabaseSettings.embedding_dim)),
+        table_name=db_r.get("table_name", DatabaseSettings.table_name),
+        region_name=db_r.get("region_name", DatabaseSettings.region_name),
+        endpoint_url=db_r.get("endpoint_url", DatabaseSettings.endpoint_url),
     )
 
+    hours_back_raw = collect_r.get("hours_back")
     collect = CollectSettings(
         concurrency=int(collect_r.get("concurrency", CollectSettings.concurrency)),
         max_items_per_feed=int(collect_r.get("max_items_per_feed", CollectSettings.max_items_per_feed)),
         backfill_max_items=int(collect_r.get("backfill_max_items", CollectSettings.backfill_max_items)),
         days_back=int(collect_r.get("days_back", CollectSettings.days_back)),
+        hours_back=int(hours_back_raw) if hours_back_raw is not None else None,
+        companies=list(collect_r.get("companies", []) or []),
         gnews_concurrency=int(collect_r.get("gnews_concurrency", CollectSettings.gnews_concurrency)),
         request_delay_seconds=float(collect_r.get("request_delay_seconds", CollectSettings.request_delay_seconds)),
         request_jitter_seconds=float(collect_r.get("request_jitter_seconds", CollectSettings.request_jitter_seconds)),
@@ -237,7 +250,6 @@ def load_radar_config(yaml_path: str | Path) -> RadarConfig:
 
     sources = SourcesSettings(
         yaml_path=Path(sources_r.get("yaml_path", "configs/radar_sources.yaml")),
-        auto_seed=bool(sources_r.get("auto_seed", SourcesSettings.auto_seed)),
     )
 
     return RadarConfig(db=db, collect=collect, fetch=fetch, dedup=dedup, summarize=summarize, sources=sources)

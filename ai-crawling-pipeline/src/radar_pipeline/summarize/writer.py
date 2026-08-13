@@ -1,7 +1,7 @@
 """JSON writer for summarized articles.
 
-Produces outputs/radar/processed/<source_id>/<article_id>_<hash>.json with
-article metadata and LLM-generated summary fields.
+Produces outputs/radar/processed/<source_id>/<hash>.json with article
+metadata and LLM-generated summary fields.
 """
 from __future__ import annotations
 
@@ -9,13 +9,12 @@ import json
 from pathlib import Path
 
 
-def make_summary_slug(source_id: str, article_id: int, article_hash: str) -> str:
-    return f"{source_id}_{article_id}_{article_hash[:8]}"
+def make_summary_slug(source_id: str, article_hash: str) -> str:
+    return f"{source_id}_{article_hash[:8]}"
 
 
 def write_summary_json(
     output_dir: Path,
-    article_id: int,
     article_hash: str,
     source_id: str,
     source_name: str,
@@ -37,11 +36,10 @@ def write_summary_json(
     source_dir = output_dir / source
     source_dir.mkdir(parents=True, exist_ok=True)
 
-    slug = make_summary_slug(source, article_id, article_hash)
+    slug = make_summary_slug(source, article_hash)
     out_path = source_dir / f"{slug}.json"
 
     payload = {
-        "id": article_id,
         "id_hash": article_hash,
         "source": source,
         "source_name": source_name,

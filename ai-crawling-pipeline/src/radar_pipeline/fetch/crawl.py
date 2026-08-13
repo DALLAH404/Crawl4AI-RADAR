@@ -11,7 +11,7 @@ from pathlib import Path
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
-from radar_pipeline.db import pending_articles
+from radar_pipeline.db import pending_articles, update_article
 from radar_pipeline.fetch.image import fetch_og_image
 from radar_pipeline.fetch.writer import write_article_md
 from radar_pipeline.sources.gnews import resolve_google_news_url
@@ -22,11 +22,11 @@ DEFAULT_CONCURRENCY = 4
 
 
 async def fetch_articles(
-    con,
+    store,
     config,
     concurrency: int = DEFAULT_CONCURRENCY,
 ) -> dict[str, int]:
-    articles = pending_articles(con)
+    articles = pending_articles(store)
     if not articles:
         logger.info("No pending articles to fetch")
         return {"total": 0, "fetched": 0, "failed": 0}
@@ -86,9 +86,9 @@ async def fetch_articles(
                 ).hexdigest()
 
                 from radar_pipeline.db import find_by_article_hash
-                existing = find_by_article_hash(con, article_hash)
-                if existing is not None and existing["id"] != article["id"]:
-                    logger.info("Skipping duplicate URL for article %d", article["id"])
+                existing = find_by_article_hash(store, article_hash)
+                if existing is not None and existing["article_hash"] != article["article_hash"]:
+                    logger.info("Skipping duplicate URL for article %s", article["article_hash"])
                     return False
 
                 if article.get("image_url"):
@@ -99,7 +99,7 @@ async def fetch_articles(
                         image_url = await fetch_og_image(target_url, img_client)
 
                 target = Target(
-                    slug=f"radar_{article['id']}",
+                    slug=f"radar_{article['article_hash'][:12]}",
                     url=target_url,
                 )
 
@@ -118,13 +118,13 @@ async def fetch_articles(
                     )
 
                 if exc is not None or result is None or not result.success:
-                    logger.warning("Fetch failed for article %d: %s", article["id"], exc or "no result")
+                    logger.warning("Fetch failed for article %s: %s", article["article_hash"], exc or "no result")
                     failed += 1
                     return False
 
                 markdown = result.markdown or ""
                 if not markdown.strip():
-                    logger.warning("Empty markdown for article %d", article["id"])
+                    logger.warning("Empty markdown for article %s", article["article_hash"])
                     failed += 1
                     return False
 
@@ -146,23 +146,18 @@ async def fetch_articles(
                     image_url=image_url,
                 )
 
-                con.execute(
-                    "UPDATE articles SET image_url = ? WHERE id = ?",
-                    (image_url, article["id"]),
-                )
+                update_article(store, article["article_hash"], image_url=image_url)
 
                 fetched += 1
                 return True
 
             except Exception as exc:
-                logger.exception("Fetch error for article %d", article["id"])
+                logger.exception("Fetch error for article %s", article["article_hash"])
                 failed += 1
                 return False
 
     tasks = [_fetch_one(a) for a in articles]
     await asyncio.gather(*tasks, return_exceptions=True)
-
-    con.commit()
 
     return {
         "total": len(articles),

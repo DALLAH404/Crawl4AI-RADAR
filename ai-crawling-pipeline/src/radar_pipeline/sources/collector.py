@@ -27,6 +27,7 @@ Modernized niceties vs. the legacy version:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import logging
 import time
@@ -37,13 +38,7 @@ from typing import Any
 import httpx
 
 from radar_pipeline.classify.rules import classify_article, eh_fora_de_escopo
-from radar_pipeline.db import (
-    find_by_article_hash,
-    find_by_raw_link,
-    get_active_sources,
-    insert_article,
-    insert_collection_run,
-)
+from radar_pipeline.db import find_by_article_hash, find_by_raw_link, put_article
 from radar_pipeline.models import Article, CollectionRun, CollectionStats
 from radar_pipeline.sources.feedparser import FeedFetchError, fetch_and_parse
 from radar_pipeline.sources.gnews import resolve_google_news_url
@@ -70,7 +65,13 @@ def _gnews_url(query: str) -> str:
     )
 
 
-def _feed_url(source: dict[str, Any], mode: str, days_back: int, backfill_days: int) -> str:
+def _feed_url(
+    source: dict[str, Any],
+    mode: str,
+    days_back: int,
+    backfill_days: int,
+    hours_back: int | None = None,
+) -> str:
     if source["feed_type"] == "linkedin_company":
         return company_page_url(source["query_text"])
 
@@ -80,6 +81,8 @@ def _feed_url(source: dict[str, Any], mode: str, days_back: int, backfill_days: 
     q = source["query_text"] or source["tag"] or source["name"]
     if mode == "backfill":
         q += f" when:{backfill_days}d"
+    elif hours_back is not None:
+        q += f" when:{hours_back}h"
     elif days_back > 0:
         q += f" when:{days_back}d"
 
@@ -125,10 +128,10 @@ async def _fetch_items(
             )
         except LinkedInBlockedError as exc:
             raise FeedFetchError(f"linkedin blocked: {exc.reason}", url=_feed_url(
-                source, mode, config.days_back, config.backfill_days,
+                source, mode, config.days_back, config.backfill_days, config.hours_back,
             )) from exc
 
-    url = _feed_url(source, mode, config.days_back, config.backfill_days)
+    url = _feed_url(source, mode, config.days_back, config.backfill_days, config.hours_back)
     try:
         return await fetch_and_parse(
             url,
@@ -146,7 +149,7 @@ async def _fetch_items(
 
 
 async def _process_source(
-    con,
+    store,
     source: dict[str, Any],
     batch_id: str,
     mode: str,
@@ -173,9 +176,13 @@ async def _process_source(
         max_items = config.backfill_max_items if mode == "backfill" else config.max_items_per_feed
         items = items[:max_items]
 
-        cutoff = datetime.now(timezone.utc) - timedelta(
-            days=config.days_back if mode != "backfill" else config.backfill_days
-        )
+        if mode == "backfill":
+            window = timedelta(days=config.backfill_days)
+        elif config.hours_back is not None:
+            window = timedelta(hours=config.hours_back)
+        else:
+            window = timedelta(days=config.days_back)
+        cutoff = datetime.now(timezone.utc) - window
 
         new_count = 0
         for item in items:
@@ -197,7 +204,7 @@ async def _process_source(
             # are already canonical, so this is also the only dedup check
             # they need (no resolver step below).
             raw_link = item["link"]
-            existing_raw = find_by_raw_link(con, raw_link)
+            existing_raw = find_by_raw_link(store, raw_link)
             if existing_raw is not None:
                 continue
 
@@ -217,7 +224,7 @@ async def _process_source(
 
             article_hash = _md5(resolved_link)
 
-            existing = find_by_article_hash(con, article_hash)
+            existing = find_by_article_hash(store, article_hash)
             if existing is not None:
                 continue
 
@@ -247,11 +254,11 @@ async def _process_source(
                 ingestion_batch_id=batch_id,
                 source_id=source["source_id"],
                 source_name=source["name"],
+                feed_type=source["feed_type"],
                 extra=item.get("extra", ""),
             )
 
-            rowid = insert_article(con, article, commit=False)
-            if rowid is not None:
+            if put_article(store, article):
                 new_count += 1
 
         run.items_new = new_count
@@ -273,48 +280,51 @@ async def _process_source(
 
 
 def _reduce_results(
-    con,
     sources: list[dict[str, Any]],
     results: list[CollectionRun | BaseException],
     batch_id: str,
     mode: str,
     stats: CollectionStats,
 ) -> None:
+    # Per-run audit history (the old collection_runs table) isn't persisted
+    # to DynamoDB — see the Phase 1 design notes — so each run's outcome is
+    # only recorded here, in CollectionStats, and in the structured log
+    # below (which lands in CloudWatch Logs once this runs on Fargate).
     for i, result in enumerate(results):
         if isinstance(result, BaseException):
-            run = CollectionRun(
-                run_id=batch_id,
-                source_id=sources[i]["source_id"],
-                source_name=sources[i]["name"],
-                executed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                mode=mode,
-                status="error",
-                error_message=str(result)[:500],
-            )
             stats.sources_error += 1
+            logger.error(
+                "collect error for %s: %s", sources[i]["name"], str(result)[:500],
+            )
+            continue
+
+        run = result
+        if run.status == "ok":
+            stats.sources_ok += 1
+            stats.items_found += run.items_found
+            stats.items_new += run.items_new
         else:
-            run = result
-            if run.status == "ok":
-                stats.sources_ok += 1
-                stats.items_found += run.items_found
-                stats.items_new += run.items_new
-            else:
-                stats.sources_error += 1
-                stats.errors.append({
-                    "source": run.source_name,
-                    "error": run.error_message,
-                })
-
-        insert_collection_run(con, run)
+            stats.sources_error += 1
+            stats.errors.append({
+                "source": run.source_name,
+                "error": run.error_message,
+            })
 
 
-async def collect_once(con, config, mode: str = "normal") -> CollectionStats:
+async def collect_once(store, sources: list, config, mode: str = "normal") -> CollectionStats:
+    """`sources` is every active Source the caller wants considered (already
+    filtered to `active: true`); this function applies the config-driven
+    company scope (`config.companies`) on top of that."""
     start = time.monotonic()
     batch_id = uuid.uuid4().hex[:12]
 
-    all_sources = get_active_sources(con)
+    if config.companies:
+        wanted = set(config.companies)
+        sources = [s for s in sources if s.tag in wanted]
+
+    all_sources = [dataclasses.asdict(s) for s in sources]
     if not all_sources:
-        logger.warning("No active sources found; seed from YAML first.")
+        logger.warning("No active sources found (after the company filter, if any).")
         return CollectionStats()
 
     linkedin_sources = [s for s in all_sources if s["feed_type"] == "linkedin_company"]
@@ -343,14 +353,14 @@ async def collect_once(con, config, mode: str = "normal") -> CollectionStats:
                     follow_redirects=True,
                 ) as client:
                     return await _process_source(
-                        con, s, batch_id, mode, client, limiter, config,
+                        store, s, batch_id, mode, client, limiter, config,
                     )
 
         rss_results = await asyncio.gather(
             *(_bounded_rss(s) for s in rss_sources),
             return_exceptions=True,
         )
-        _reduce_results(con, rss_sources, rss_results, batch_id, mode, stats)
+        _reduce_results(rss_sources, rss_results, batch_id, mode, stats)
 
     # LinkedIn pass — separate, low-concurrency: each source holds its slot
     # for tens of seconds (browser launch + inter-company delay) and would
@@ -369,15 +379,14 @@ async def collect_once(con, config, mode: str = "normal") -> CollectionStats:
             async def _bounded_linkedin(s: dict[str, Any]) -> CollectionRun:
                 async with li_semaphore:
                     return await _process_source(
-                        con, s, batch_id, mode, li_client, li_limiter, config,
+                        store, s, batch_id, mode, li_client, li_limiter, config,
                     )
 
             linkedin_results = await asyncio.gather(
                 *(_bounded_linkedin(s) for s in linkedin_sources),
                 return_exceptions=True,
             )
-        _reduce_results(con, linkedin_sources, linkedin_results, batch_id, mode, stats)
+        _reduce_results(linkedin_sources, linkedin_results, batch_id, mode, stats)
 
-    con.commit()
     stats.duration_ms = int((time.monotonic() - start) * 1000)
     return stats

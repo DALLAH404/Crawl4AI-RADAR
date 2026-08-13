@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import logging
 import sys
 from pathlib import Path
@@ -12,11 +13,11 @@ from dotenv import load_dotenv
 
 from radar_pipeline.config import load_radar_config
 from radar_pipeline.db import (
+    article_count,
     article_count_by_category,
     article_count_by_status,
     connect,
-    init_schema,
-    run_migrations,
+    ensure_table,
 )
 from radar_pipeline.observability.logging import setup_logging
 from radar_pipeline.observability.metrics import MetricsCollector
@@ -24,16 +25,19 @@ from radar_pipeline.observability.metrics import MetricsCollector
 logger = logging.getLogger("radar_pipeline")
 
 
-def cmd_collect(con, config, metrics: MetricsCollector) -> None:
-    from radar_pipeline.sources.catalog import seed_from_yaml
+def _active_sources(config):
+    from radar_pipeline.sources import catalog
+
+    return catalog.list_sources(config.sources.yaml_path, active_only=True)
+
+
+def cmd_collect(store, config, metrics: MetricsCollector, mode: str = "normal") -> None:
     from radar_pipeline.sources.collector import collect_once
 
-    if config.sources.auto_seed:
-        seed_from_yaml(con, config.sources.yaml_path)
-
+    sources = _active_sources(config)
     run = metrics.start("collect")
-    print(f"Collecting from {config.sources.yaml_path}...")
-    stats = asyncio.run(collect_once(con, config.collect))
+    print(f"Collecting from {config.sources.yaml_path} (mode={mode})...")
+    stats = asyncio.run(collect_once(store, sources, config.collect, mode=mode))
     run.finish(
         success=stats.sources_error == 0,
         sources_ok=stats.sources_ok,
@@ -51,7 +55,7 @@ def cmd_collect(con, config, metrics: MetricsCollector) -> None:
     )
 
 
-def cmd_fetch(con, config, metrics: MetricsCollector) -> None:
+def cmd_fetch(store, config, metrics: MetricsCollector) -> None:
     from radar_pipeline.fetch.crawl import fetch_articles
 
     if config.fetch is None:
@@ -60,7 +64,7 @@ def cmd_fetch(con, config, metrics: MetricsCollector) -> None:
 
     run = metrics.start("fetch")
     print("Fetching articles...")
-    result = asyncio.run(fetch_articles(con, config.fetch))
+    result = asyncio.run(fetch_articles(store, config.fetch))
     run.finish(**result)
     print(
         f"Done: {result['total']} pending, {result['fetched']} fetched, "
@@ -68,7 +72,7 @@ def cmd_fetch(con, config, metrics: MetricsCollector) -> None:
     )
 
 
-def cmd_dedup(con, config, metrics: MetricsCollector) -> None:
+def cmd_dedup(store, config, metrics: MetricsCollector) -> None:
     from radar_pipeline.dedup.layers import run_dedup
 
     if config.dedup is None:
@@ -77,7 +81,7 @@ def cmd_dedup(con, config, metrics: MetricsCollector) -> None:
 
     run = metrics.start("dedup")
     print("Running dedup...")
-    result = asyncio.run(run_dedup(con, config.dedup))
+    result = asyncio.run(run_dedup(store, config.dedup))
     run.finish(**result)
     print(
         f"Done: {result['total']} processed, {result['new']} new, "
@@ -85,7 +89,7 @@ def cmd_dedup(con, config, metrics: MetricsCollector) -> None:
     )
 
 
-def cmd_summarize(con, config, metrics: MetricsCollector) -> None:
+def cmd_summarize(store, config, metrics: MetricsCollector) -> None:
     from radar_pipeline.summarize.pipeline import run_summarize
 
     if config.summarize is None:
@@ -94,7 +98,7 @@ def cmd_summarize(con, config, metrics: MetricsCollector) -> None:
 
     run = metrics.start("summarize")
     print(f"Summarizing articles (model={config.summarize.llm.model})...")
-    result = asyncio.run(run_summarize(con, config.summarize))
+    result = asyncio.run(run_summarize(store, config.summarize))
     run.finish(**result)
     print(
         f"Done: {result['total']} pending, {result['summarized']} summarized, "
@@ -102,78 +106,48 @@ def cmd_summarize(con, config, metrics: MetricsCollector) -> None:
     )
 
 
-def cmd_classify(con, config, metrics: MetricsCollector) -> None:
+def cmd_classify(store, config, metrics: MetricsCollector) -> None:
     from radar_pipeline.classify.rules import classify_article
+    from radar_pipeline.db import pending_articles, update_article
 
     run = metrics.start("classify")
-    updated = 0
-    from radar_pipeline.db import pending_articles
-    articles = pending_articles(con)
+    articles = pending_articles(store)
     print(f"Re-classifying {len(articles)} pending articles...")
     for a in articles:
         event_type, alert_level, is_launch = classify_article(
             a["title"], a["action_description"]
         )
-        con.execute(
-            "UPDATE articles SET event_type = ?, alert_level = ?, is_launch = ? WHERE id = ?",
-            (event_type, alert_level, int(is_launch), a["id"]),
+        update_article(
+            store, a["article_hash"],
+            event_type=event_type, alert_level=alert_level, is_launch=is_launch,
         )
-        updated += 1
-    con.commit()
-    run.finish(updated=updated)
-    print(f"Done: {updated} articles re-classified")
+    run.finish(updated=len(articles))
+    print(f"Done: {len(articles)} articles re-classified")
 
 
-def cmd_status(con, config, metrics: MetricsCollector) -> None:
-    from radar_pipeline.db import (
-        article_count,
-        article_count_by_category,
-        article_count_by_status,
-        get_all_sources,
-    )
-
-    sources = get_all_sources(con)
-    active = [s for s in sources if s["active"]]
-    total_articles = article_count(con)
-    by_status = article_count_by_status(con)
-    by_category = article_count_by_category(con)
-
-    stale = con.execute(
-        "SELECT source_id, name, source_type, last_success FROM vw_stale_sources"
-    ).fetchall()
+def cmd_status(store, config, metrics: MetricsCollector) -> None:
+    sources = _active_sources(config)
+    total_articles = article_count(store)
+    by_status = article_count_by_status(store)
+    by_category = article_count_by_category(store)
 
     print("=== Status ===")
-    print(f"Sources: {len(active)} active / {len(sources)} total")
+    print(f"Sources: {len(sources)} active (per {config.sources.yaml_path})")
     print(f"Articles: {total_articles} active (non-irrelevant)")
     print(f"  by status: {by_status}")
     print(f"  by category: {by_category}")
-    if stale:
-        print(f"Stale sources (>7 days since last success): {len(stale)}")
-        for s in stale:
-            print(f"  - {s['name']} ({s['source_type']}) last: {s['last_success']}")
 
 
-def cmd_sources(con, args, config) -> None:
+def cmd_sources(config, args) -> None:
     from radar_pipeline.sources import catalog
 
-    if args.sources_action == "list":
-        sources = catalog.list_sources(con, active_only=args.active_only)
-        for s in sources:
-            status = "active" if s["active"] else "disabled"
-            print(f"  [{status}] {s['source_id']}: {s['name']} ({s['source_type']}/{s['category']})")
-    elif args.sources_action == "enable":
-        ok = catalog.set_active(con, args.source_id, True)
-        print(f"{'Enabled' if ok else 'Not found'}: {args.source_id}")
-    elif args.sources_action == "disable":
-        ok = catalog.set_active(con, args.source_id, False)
-        print(f"{'Disabled' if ok else 'Not found'}: {args.source_id}")
-    elif args.sources_action == "import-yaml":
-        count = catalog.seed_from_yaml(con, config.sources.yaml_path)
-        print(f"Imported {count} sources from {config.sources.yaml_path}")
+    sources = catalog.list_sources(config.sources.yaml_path, active_only=args.active_only)
+    for s in sources:
+        status = "active" if s.active else "disabled"
+        print(f"  [{status}] {s.source_id}: {s.name} ({s.source_type}/{s.category})")
 
 
-def cmd_validate_feeds(con, config, metrics: MetricsCollector) -> None:
-    from radar_pipeline.db import get_active_sources
+def cmd_validate_feeds(config, metrics: MetricsCollector) -> None:
     from radar_pipeline.sources.feedparser import fetch_and_parse
     from radar_pipeline.sources.collector import _feed_url
 
@@ -181,12 +155,12 @@ def cmd_validate_feeds(con, config, metrics: MetricsCollector) -> None:
         from radar_pipeline.sources.feedparser import FeedFetchError
         from radar_pipeline.sources.ratelimit import HostBlockedError
 
-        sources = get_active_sources(con)
+        sources = [dataclasses.asdict(s) for s in _active_sources(config)]
         import httpx
         results = []
         async with httpx.AsyncClient(timeout=30.0) as client:
             for s in sources:
-                url = _feed_url(s, "normal", config.collect.days_back, config.collect.backfill_days)
+                url = _feed_url(s, "normal", config.collect.days_back, config.collect.backfill_days, config.collect.hours_back)
                 if s["feed_type"] == "linkedin_company":
                     # httpx probing is meaningless against a browser-rendered
                     # LinkedIn page; use --collect to actually validate these.
@@ -216,7 +190,7 @@ def cmd_validate_feeds(con, config, metrics: MetricsCollector) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="radar-pipeline",
-        description="Radar Aftermarket Pipeline — local-first news aggregation with AI",
+        description="Radar Aftermarket Pipeline — news aggregation with AI, on DynamoDB",
     )
     p.add_argument(
         "--config", default="configs/radar.yaml",
@@ -225,23 +199,33 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--collect", action="store_true", help="Poll all active sources")
     p.add_argument("--classify", action="store_true", help="Re-run keyword classifier")
     p.add_argument("--fetch", action="store_true", help="Crawl articles that have a URL")
-    p.add_argument("--dedup", action="store_true", help="Run 5-layer dedup on pending articles")
+    p.add_argument("--dedup", action="store_true", help="Run dedup on pending articles")
     p.add_argument("--summarize", action="store_true", help="Summarize pending articles via LLM")
     p.add_argument("--status", action="store_true", help="Print source and article statistics")
     p.add_argument(
         "--validate-feeds", action="store_true",
         help="Probe every active source URL (no inserts)",
     )
+    p.add_argument(
+        "--backfill", action="store_true",
+        help="Scope --collect to config.collect.backfill_days (a wide manual "
+        "catch-up range) instead of the normal narrow schedule window",
+    )
+    p.add_argument(
+        "--companies", default=None,
+        help="Comma-separated company tags to scope --collect to (overrides "
+        "collect.companies in the config); omit for every active source",
+    )
+    p.add_argument(
+        "--hours-back", type=int, default=None,
+        help="Override collect.hours_back for this run, e.g. 3 for the "
+        "every-3-hours schedule (normal mode only)",
+    )
 
-    sub = p.add_subparsers(dest="sources_action", help="Source catalog management")
-    sub.add_parser("sources-list", help="List all sources").add_argument(
+    sub = p.add_subparsers(dest="sources_action", help="Source catalog inspection")
+    sub.add_parser("sources-list", help="List sources from the YAML catalog").add_argument(
         "--active-only", action="store_true"
     )
-    sub.add_parser("sources-import-yaml", help="Re-import from YAML")
-    e = sub.add_parser("sources-enable", help="Enable a source")
-    e.add_argument("source_id", help="Source ID to enable")
-    d = sub.add_parser("sources-disable", help="Disable a source")
-    d.add_argument("source_id", help="Source ID to disable")
 
     return p
 
@@ -256,13 +240,17 @@ def main() -> None:
     cfg_path = Path(args.config) if args.config else Path("configs/radar.yaml")
     config = load_radar_config(cfg_path)
 
-    con = connect(config.db.path)
-    try:
-        init_schema(con, dim=config.db.embedding_dim)
-        run_migrations(con)
-    except Exception as exc:
-        logger.error("Schema initialization failed: %s", exc)
-        sys.exit(1)
+    if args.companies is not None:
+        config.collect.companies = [c.strip() for c in args.companies.split(",") if c.strip()]
+    if args.hours_back is not None:
+        config.collect.hours_back = args.hours_back
+
+    store = connect(config.db.table_name, config.db.region_name or None, config.db.endpoint_url or None)
+    if config.db.endpoint_url:
+        # Local/dev endpoint (dynamodb-local, moto) — create the table if
+        # it's missing. Against real AWS the table is created once via the
+        # console/CLI steps in DEPLOYMENT.md, not by the app on every boot.
+        ensure_table(store)
 
     metrics = MetricsCollector()
 
@@ -276,33 +264,33 @@ def main() -> None:
     if run_default:
         args.collect = args.fetch = args.dedup = args.summarize = True
 
+    mode = "backfill" if args.backfill else "normal"
+
     try:
         if args.collect:
-            cmd_collect(con, config, metrics)
+            cmd_collect(store, config, metrics, mode=mode)
 
         if args.classify:
-            cmd_classify(con, config, metrics)
+            cmd_classify(store, config, metrics)
 
         if args.fetch:
-            cmd_fetch(con, config, metrics)
+            cmd_fetch(store, config, metrics)
 
         if args.dedup:
-            cmd_dedup(con, config, metrics)
+            cmd_dedup(store, config, metrics)
 
         if args.summarize:
-            cmd_summarize(con, config, metrics)
+            cmd_summarize(store, config, metrics)
 
         if args.status:
-            cmd_status(con, config, metrics)
+            cmd_status(store, config, metrics)
 
         if args.validate_feeds:
-            cmd_validate_feeds(con, config, metrics)
+            cmd_validate_feeds(config, metrics)
 
         if args.sources_action == "sources-list":
             args.active_only = getattr(args, "active_only", False)
-            cmd_sources(con, args, config)
-        elif args.sources_action in ("sources-enable", "sources-disable", "sources-import-yaml"):
-            cmd_sources(con, args, config)
+            cmd_sources(config, args)
 
     except Exception as exc:
         logger.exception("Pipeline failed")
@@ -310,7 +298,6 @@ def main() -> None:
         sys.exit(1)
     finally:
         print(metrics.summary())
-        con.close()
 
 
 if __name__ == "__main__":

@@ -1,482 +1,487 @@
-"""SQLite + sqlite-vec database layer for the Radar Aftermarket Pipeline.
+"""DynamoDB storage layer for the Radar Aftermarket Pipeline.
 
-Schema: sources, articles, collection_runs, vec_articles (vec0),
-articles_fts (fts5), and views for source health monitoring.
+Single table, four GSIs. Identity is `article_hash` (md5 of the resolved
+article URL) everywhere — there is no auto-increment ID; DynamoDB has no
+equivalent of SQLite's ROWID, and keying writes off a value derived from
+the article itself is what makes them idempotent (a re-scraped article
+overwrites the same item instead of creating a new one).
+
+Item types (all in the one `radar-articles` table):
+
+    Base article    pk=ARTICLE#<hash>          sk=METADATA
+                     gsi2pk=ARTICLE             gsi2sk=<ts>#<hash>   (LatestIndex)
+                     gsi3pk=TITLEHASH#<hash>    gsi3sk=<ts>#<hash>   (DedupIndex)
+                     gsi4pk=PENDING             gsi4sk=<ts>#<hash>   (PendingIndex,
+                                                                      only while pending)
+
+    Raw-link pointer pk=ARTICLE#<hash>          sk=RAWLINK#<rawhash>
+                     gsi3pk=RAWLINK#<rawhash>   gsi3sk=METADATA      (DedupIndex)
+
+    Company link     pk=ARTICLE#<hash>          sk=COMPANY#<tag>
+                     gsi1pk=COMPANY#<tag>       gsi1sk=<ts>#<hash>   (CompanyTimeIndex)
+                     (denormalized display fields, so the per-company feed
+                     reads in one Query with no follow-up GetItem)
+
+All four GSIs project ALL attributes — item sizes here are tiny (a news
+article's text, not a blob) so the extra storage/WCU cost buys skipping an
+N+1 GetItem on every read path.
+
+`ensure_table()` is for local/dev use only (moto, dynamodb-local) — the
+production table is created once via the AWS console/CLI steps in
+DEPLOYMENT.md, not by the application on every boot.
 
 Public API:
-    connect(db_path) -> sqlite3.Connection
-    init_schema(con, dim) -> None
-    run_migrations(con) -> None
+    connect(table_name, region_name, endpoint_url) -> RadarStore
+    ensure_table(store) -> None                          (local/dev only)
+    put_article(store, article) -> bool                  (idempotent insert)
+    update_article(store, article_hash, **changes) -> dict | None
+    get_article(store, article_hash) -> dict | None
+    find_by_article_hash(store, article_hash, exclude_hash=None) -> dict | None
+    find_by_raw_link(store, raw_link) -> dict | None
+    find_by_title_hash_within(store, title_hash, since_ts, exclude_hash=None) -> dict | None
+    pending_articles(store, limit=None) -> list[dict]
+    latest_articles(store, limit=20) -> list[dict]
+    articles_for_company(store, company, since_ts, until_ts=None, limit=None) -> list[dict]
+    articles_for_companies(store, companies, since_ts, until_ts=None, limit=None) -> list[dict]
+    mark_article_irrelevant(store, article_hash) -> None
+    mark_article_failed(store, article_hash, error="") -> None
+    article_count(store) -> int
+    article_count_by_status(store) -> dict[str, int]
+    article_count_by_category(store) -> dict[str, int]
 """
 
 from __future__ import annotations
 
-import json
+import hashlib
 import os
-import time
-from pathlib import Path
-from typing import Any, Iterable
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any
 
-import pysqlite3 as sqlite3
-import sqlite_vec
+import boto3
+from boto3.dynamodb.conditions import Attr, Key
+from botocore.exceptions import ClientError
 
-SCHEMA_VERSION = 2
+from radar_pipeline.models import Article
 
+DEFAULT_TABLE_NAME = "radar-articles"
 
-def connect(db_path: str | os.PathLike | None = None) -> sqlite3.Connection:
-    p = Path(db_path) if db_path is not None else Path("outputs/radar/radar.db")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(p))
-    con.enable_load_extension(True)
-    sqlite_vec.load(con)
-    con.enable_load_extension(False)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode = WAL;")
-    con.execute("PRAGMA foreign_keys = ON;")
-    con.execute("PRAGMA synchronous = NORMAL;")
-    return con
+_INTERNAL_KEYS = {
+    "pk", "sk",
+    "gsi1pk", "gsi1sk", "gsi2pk", "gsi2sk", "gsi3pk", "gsi3sk", "gsi4pk", "gsi4sk",
+}
 
 
-def init_schema(con: sqlite3.Connection, dim: int = 768) -> None:
-    con.executescript(f"""
-        CREATE TABLE IF NOT EXISTS schema_version (
-            version INTEGER PRIMARY KEY,
-            applied_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        );
-
-        CREATE TABLE IF NOT EXISTS sources (
-            source_id     TEXT PRIMARY KEY,
-            name          TEXT NOT NULL,
-            source_type   TEXT CHECK(source_type IN
-                          ('portal','entidade','concorrente','tema','tecnologia','economia','lancamento')),
-            tag           TEXT,
-            product_line  TEXT,
-            category      TEXT CHECK(category IN ('auto','economia','tecnologia')),
-            feed_type     TEXT CHECK(feed_type IN ('rss_direct','google_news_query','linkedin_company')),
-            rss_url       TEXT,
-            query_text    TEXT,
-            active        INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
-            created_at    TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            updated_at    TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_sources_active_type ON sources(active, source_type);
-
-        CREATE TABLE IF NOT EXISTS articles (
-            id                  INTEGER PRIMARY KEY,
-            article_hash        TEXT NOT NULL UNIQUE,
-            title_hash          TEXT,
-            published_at        TEXT,
-            collected_at        TEXT NOT NULL,
-            category            TEXT CHECK(category IN ('auto','economia','tecnologia')),
-            competitor_tag      TEXT,
-            product_line        TEXT,
-            title               TEXT NOT NULL,
-            action_description  TEXT,
-            summary             TEXT,
-            competitor_analysis TEXT,
-            summary_status      TEXT NOT NULL DEFAULT 'pending'
-                                 CHECK(summary_status IN
-                                   ('pending','ai_generated','scraped_fallback','irrelevant','failed')),
-            ai_model            TEXT,
-            ai_processed_at     TEXT,
-            event_type          TEXT,
-            alert_level         TEXT CHECK(alert_level IN ('Alto','Medio','Baixo','')),
-            is_launch           INTEGER NOT NULL DEFAULT 0 CHECK(is_launch IN (0,1)),
-            image_url           TEXT,
-            link                TEXT NOT NULL UNIQUE,
-            raw_link            TEXT,
-            ingestion_batch_id  TEXT,
-            source_id           TEXT REFERENCES sources(source_id),
-            source_name         TEXT NOT NULL,
-            dedup_layer         INTEGER,
-            dedup_decision      TEXT CHECK(dedup_decision IN ('new','duplicate','')),
-            dedup_reason        TEXT,
-            dedup_match_id      INTEGER REFERENCES articles(id),
-            dedup_score         REAL,
-            extra               TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_articles_category     ON articles(category);
-        CREATE INDEX IF NOT EXISTS idx_articles_competitor   ON articles(competitor_tag);
-        CREATE INDEX IF NOT EXISTS idx_articles_published_at ON articles(published_at);
-        CREATE INDEX IF NOT EXISTS idx_articles_is_launch    ON articles(is_launch) WHERE is_launch = 1;
-        CREATE INDEX IF NOT EXISTS idx_articles_pending_ai   ON articles(summary_status) WHERE summary_status = 'pending';
-        CREATE INDEX IF NOT EXISTS idx_articles_title_hash   ON articles(title_hash);
-        CREATE INDEX IF NOT EXISTS idx_articles_dedup_match  ON articles(dedup_match_id);
-        CREATE INDEX IF NOT EXISTS idx_articles_raw_link     ON articles(raw_link) WHERE raw_link IS NOT NULL AND raw_link != '';
-
-        CREATE TABLE IF NOT EXISTS collection_runs (
-            id             INTEGER PRIMARY KEY,
-            run_id         TEXT NOT NULL,
-            source_id      TEXT REFERENCES sources(source_id),
-            source_name    TEXT,
-            executed_at    TEXT NOT NULL,
-            mode           TEXT CHECK(mode IN ('normal','backfill')),
-            status         TEXT CHECK(status IN ('ok','error')),
-            items_found    INTEGER,
-            items_new      INTEGER,
-            duration_ms    INTEGER,
-            error_message  TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_runs_executed_at   ON collection_runs(executed_at);
-        CREATE INDEX IF NOT EXISTS idx_runs_source_status ON collection_runs(source_id, status);
-
-        CREATE VIEW IF NOT EXISTS vw_source_health_daily AS
-        SELECT
-          date(executed_at)          AS run_date,
-          source_id,
-          source_name,
-          SUM(status = 'error')      AS error_count,
-          SUM(status = 'ok')         AS ok_count,
-          SUM(items_new)             AS items_new_total
-        FROM collection_runs
-        GROUP BY 1, 2, 3;
-
-        CREATE VIEW IF NOT EXISTS vw_stale_sources AS
-        SELECT s.source_id, s.name, s.source_type, MAX(r.executed_at) AS last_success
-        FROM sources s
-        LEFT JOIN collection_runs r
-          ON s.source_id = r.source_id AND r.status = 'ok'
-        WHERE s.active = 1
-        GROUP BY 1, 2, 3
-        HAVING last_success IS NULL OR last_success < datetime('now', '-7 days');
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS vec_articles USING vec0(
-            embedding float[{dim}] distance_metric=cosine
-        );
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
-            title, summary, action_description,
-            content='articles', content_rowid='id'
-        );
-    """)
-
-    _ensure_fts_triggers(con)
-
-    cur = con.execute("SELECT MAX(version) FROM schema_version")
-    row = cur.fetchone()
-    current = row[0] if row and row[0] is not None else 0
-    # Only stamp on a genuinely fresh DB (no version row yet) — CREATE TABLE
-    # IF NOT EXISTS above is a no-op for an existing DB, so an existing DB at
-    # an older version must be left for run_migrations() to advance via its
-    # own migration_NNNN.apply() steps, not fast-forwarded here.
-    if current == 0:
-        con.execute(
-            "INSERT INTO schema_version (version) VALUES (?)",
-            (SCHEMA_VERSION,),
-        )
-    con.commit()
+@dataclass
+class RadarStore:
+    table: Any  # boto3 DynamoDB Table resource
 
 
-def _ensure_fts_triggers(con: sqlite3.Connection) -> None:
-    cur = con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='articles_ai'"
-    )
-    if cur.fetchone() is not None:
+def connect(
+    table_name: str | None = None,
+    region_name: str | None = None,
+    endpoint_url: str | None = None,
+) -> RadarStore:
+    table_name = table_name or os.environ.get("RADAR_TABLE_NAME", DEFAULT_TABLE_NAME)
+    kwargs: dict[str, Any] = {}
+    if region_name:
+        kwargs["region_name"] = region_name
+    if endpoint_url:
+        kwargs["endpoint_url"] = endpoint_url
+    resource = boto3.resource("dynamodb", **kwargs)
+    return RadarStore(table=resource.Table(table_name))
+
+
+def ensure_table(store: RadarStore) -> None:
+    """Create the table (on-demand billing) with its 4 GSIs if it doesn't
+    already exist. Local/dev only — see the module docstring."""
+    client = store.table.meta.client
+    table_name = store.table.table_name
+    if table_name in client.list_tables().get("TableNames", []):
         return
 
-    con.executescript("""
-        CREATE TRIGGER articles_ai AFTER INSERT ON articles BEGIN
-            INSERT INTO articles_fts(rowid, title, summary, action_description)
-            VALUES (new.id, new.title, new.summary, new.action_description);
-        END;
-
-        CREATE TRIGGER articles_ad AFTER DELETE ON articles BEGIN
-            INSERT INTO articles_fts(articles_fts, rowid, title, summary, action_description)
-            VALUES ('delete', old.id, old.title, old.summary, old.action_description);
-        END;
-
-        CREATE TRIGGER articles_au AFTER UPDATE ON articles BEGIN
-            INSERT INTO articles_fts(articles_fts, rowid, title, summary, action_description)
-            VALUES ('delete', old.id, old.title, old.summary, old.action_description);
-            INSERT INTO articles_fts(rowid, title, summary, action_description)
-            VALUES (new.id, new.title, new.summary, new.action_description);
-        END;
-    """)
-
-
-def run_migrations(con: sqlite3.Connection) -> None:
-    cur = con.execute("SELECT MAX(version) FROM schema_version")
-    row = cur.fetchone()
-    current = row[0] if row and row[0] is not None else 0
-
-    if current < 1:
-        from radar_pipeline.migrations import migration_0001
-
-        migration_0001.apply(con)
-        con.execute(
-            "INSERT INTO schema_version (version) VALUES (1) "
-            "ON CONFLICT(version) DO NOTHING"
-        )
-        con.commit()
-        current = 1
-
-    if current < 2:
-        from radar_pipeline.migrations import migration_0002
-
-        migration_0002.apply(con)
-        con.execute(
-            "INSERT INTO schema_version (version) VALUES (2) "
-            "ON CONFLICT(version) DO NOTHING"
-        )
-        con.commit()
-
-
-def has_sources_table(con: sqlite3.Connection) -> bool:
-    return con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sources'"
-    ).fetchone() is not None
-
-
-# ----- sources -----
-
-def insert_source(con: sqlite3.Connection, s) -> None:
-    con.execute(
-        """INSERT OR REPLACE INTO sources(
-            source_id, name, source_type, tag, product_line, category,
-            feed_type, rss_url, query_text, active, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))""",
-        s.to_row(),
+    client.create_table(
+        TableName=table_name,
+        BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "sk", "AttributeType": "S"},
+            {"AttributeName": "gsi1pk", "AttributeType": "S"},
+            {"AttributeName": "gsi1sk", "AttributeType": "S"},
+            {"AttributeName": "gsi2pk", "AttributeType": "S"},
+            {"AttributeName": "gsi2sk", "AttributeType": "S"},
+            {"AttributeName": "gsi3pk", "AttributeType": "S"},
+            {"AttributeName": "gsi3sk", "AttributeType": "S"},
+            {"AttributeName": "gsi4pk", "AttributeType": "S"},
+            {"AttributeName": "gsi4sk", "AttributeType": "S"},
+        ],
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "CompanyTimeIndex",
+                "KeySchema": [
+                    {"AttributeName": "gsi1pk", "KeyType": "HASH"},
+                    {"AttributeName": "gsi1sk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+            {
+                "IndexName": "LatestIndex",
+                "KeySchema": [
+                    {"AttributeName": "gsi2pk", "KeyType": "HASH"},
+                    {"AttributeName": "gsi2sk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+            {
+                "IndexName": "DedupIndex",
+                "KeySchema": [
+                    {"AttributeName": "gsi3pk", "KeyType": "HASH"},
+                    {"AttributeName": "gsi3sk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+            {
+                "IndexName": "PendingIndex",
+                "KeySchema": [
+                    {"AttributeName": "gsi4pk", "KeyType": "HASH"},
+                    {"AttributeName": "gsi4sk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+        ],
     )
+    client.get_waiter("table_exists").wait(TableName=table_name)
 
 
-def get_active_sources(con: sqlite3.Connection) -> list[dict[str, Any]]:
-    return [dict(r) for r in con.execute(
-        "SELECT * FROM sources WHERE active = 1 ORDER BY name"
-    ).fetchall()]
+def _md5(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
-def get_all_sources(con: sqlite3.Connection) -> list[dict[str, Any]]:
-    return [dict(r) for r in con.execute("SELECT * FROM sources ORDER BY name").fetchall()]
+def _clean(item: dict) -> dict:
+    return {k: v for k, v in item.items() if k not in _INTERNAL_KEYS}
 
 
-# ----- articles -----
+def _sort_ts(article: Article) -> str:
+    # published_at is sometimes just a date ("2026-08-01"), sometimes a full
+    # timestamp; either way it's a fixed-width ISO8601 prefix, so plain
+    # string comparison against a same-shaped `since_ts` sorts correctly.
+    # collected_at (always set at construction) is the fallback so this is
+    # never empty — DynamoDB rejects an empty string as a key attribute.
+    return article.published_at or article.collected_at
 
-def insert_article(con: sqlite3.Connection, a, commit: bool = True) -> int | None:
+
+def _base_item(article: Article) -> dict:
+    ts = _sort_ts(article)
+    item: dict[str, Any] = {
+        "pk": f"ARTICLE#{article.article_hash}",
+        "sk": "METADATA",
+        "article_hash": article.article_hash,
+        "title_hash": article.title_hash,
+        "published_at": article.published_at,
+        "collected_at": article.collected_at,
+        "category": article.category,
+        "competitor_tag": article.competitor_tag,
+        "companies": article.companies(),
+        "product_line": article.product_line,
+        "title": article.title,
+        "action_description": article.action_description,
+        "summary": article.summary,
+        "competitor_analysis": article.competitor_analysis,
+        "summary_status": article.summary_status,
+        "ai_model": article.ai_model,
+        "ai_processed_at": article.ai_processed_at,
+        "event_type": article.event_type,
+        "alert_level": article.alert_level,
+        "is_launch": bool(article.is_launch),
+        "image_url": article.image_url,
+        "link": article.link,
+        "raw_link": article.raw_link,
+        "ingestion_batch_id": article.ingestion_batch_id,
+        "source_id": article.source_id,
+        "source_name": article.source_name,
+        "feed_type": article.feed_type,
+        "dedup_layer": article.dedup_layer,
+        "dedup_decision": article.dedup_decision,
+        "dedup_reason": article.dedup_reason,
+        "dedup_match_hash": article.dedup_match_hash,
+        "dedup_score": Decimal(str(article.dedup_score)) if article.dedup_score is not None else None,
+        "extra": article.extra,
+        "gsi2pk": "ARTICLE",
+        "gsi2sk": f"{ts}#{article.article_hash}",
+    }
+    if article.title_hash:
+        item["gsi3pk"] = f"TITLEHASH#{article.title_hash}"
+        item["gsi3sk"] = f"{ts}#{article.article_hash}"
+    if article.summary_status == "pending":
+        item["gsi4pk"] = "PENDING"
+        item["gsi4sk"] = f"{article.collected_at}#{article.article_hash}"
+    return {k: v for k, v in item.items() if v not in (None, "")}
+
+
+def _rawlink_item(article: Article) -> dict:
+    raw_hash = _md5(article.raw_link)
+    return {
+        "pk": f"ARTICLE#{article.article_hash}",
+        "sk": f"RAWLINK#{raw_hash}",
+        "gsi3pk": f"RAWLINK#{raw_hash}",
+        "gsi3sk": "METADATA",
+        "article_hash": article.article_hash,
+        "link": article.link,
+    }
+
+
+def _company_item(article: Article, tag: str) -> dict:
+    ts = _sort_ts(article)
+    item = {
+        "pk": f"ARTICLE#{article.article_hash}",
+        "sk": f"COMPANY#{tag}",
+        "gsi1pk": f"COMPANY#{tag}",
+        "gsi1sk": f"{ts}#{article.article_hash}",
+        "article_hash": article.article_hash,
+        "company": tag,
+        "title": article.title,
+        "link": article.link,
+        "image_url": article.image_url,
+        "category": article.category,
+        "event_type": article.event_type,
+        "alert_level": article.alert_level,
+        "summary": article.summary,
+        "summary_status": article.summary_status,
+        "published_at": ts,
+    }
+    return {k: v for k, v in item.items() if v not in (None, "")}
+
+
+def _write_article(store: RadarStore, article: Article, *, condition_new: bool) -> bool:
+    # Not wrapped in a DynamoDB transaction: the base item, raw-link pointer,
+    # and company links are three-to-a-few separate put_items rather than one
+    # atomic TransactWriteItems call. All three are keyed deterministically
+    # off article_hash, so a crash between them just leaves a gap that the
+    # next idempotent write (a re-run of the same source) fills in — an
+    # acceptable trade for a lot less complexity at this project's scale.
+    base_item = _base_item(article)
     try:
-        cur = con.execute(
-            """INSERT INTO articles(
-                article_hash, title_hash, published_at, collected_at, category,
-                competitor_tag, product_line, title, action_description,
-                summary, competitor_analysis, summary_status,
-                event_type, alert_level, is_launch, image_url, link, raw_link,
-                ingestion_batch_id, source_id, source_name,
-                dedup_layer, dedup_decision, dedup_reason, dedup_match_id,
-                dedup_score, extra
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                a.article_hash, a.title_hash, a.published_at, a.collected_at,
-                a.category, a.competitor_tag, a.product_line, a.title,
-                a.action_description, a.summary, a.competitor_analysis,
-                a.summary_status, a.event_type, a.alert_level,
-                int(a.is_launch), a.image_url, a.link, a.raw_link,
-                a.ingestion_batch_id, a.source_id, a.source_name,
-                a.dedup_layer, a.dedup_decision, a.dedup_reason,
-                a.dedup_match_id, a.dedup_score, a.extra,
-            ),
-        )
-        rowid = cur.lastrowid
-        if commit:
-            con.commit()
-        return rowid
-    except sqlite3.IntegrityError:
+        if condition_new:
+            store.table.put_item(Item=base_item, ConditionExpression="attribute_not_exists(pk)")
+        else:
+            store.table.put_item(Item=base_item)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        raise
+
+    if article.raw_link:
+        store.table.put_item(Item=_rawlink_item(article))
+
+    for tag in article.companies():
+        store.table.put_item(Item=_company_item(article, tag))
+
+    return True
+
+
+def put_article(store: RadarStore, article: Article) -> bool:
+    """Idempotent insert. Returns False (no-op) if article_hash already
+    exists — the caller does not need to check-then-insert separately."""
+    return _write_article(store, article, condition_new=True)
+
+
+def _dict_to_article(d: dict) -> Article:
+    fields = {k: v for k, v in d.items() if k in Article.__dataclass_fields__}
+    if isinstance(fields.get("dedup_score"), Decimal):
+        fields["dedup_score"] = float(fields["dedup_score"])
+    if "is_launch" in fields:
+        fields["is_launch"] = bool(fields["is_launch"])
+    return Article(**fields)
+
+
+def update_article(store: RadarStore, article_hash: str, **changes: Any) -> dict | None:
+    """Read-merge-rewrite. Rewrites the base item plus every company-link
+    item for this article, so denormalized display fields never drift."""
+    existing = get_article(store, article_hash)
+    if existing is None:
         return None
+    article = _dict_to_article({**existing, **changes})
+    _write_article(store, article, condition_new=False)
+    return get_article(store, article_hash)
 
 
-def find_by_article_hash(
-    con: sqlite3.Connection,
-    article_hash: str,
-    exclude_id: int | None = None,
-) -> sqlite3.Row | None:
-    sql = (
-        "SELECT * FROM articles WHERE article_hash = ? "
-        "AND summary_status != 'irrelevant'"
-    )
-    params: list[Any] = [article_hash]
-    if exclude_id is not None:
-        sql += " AND id != ?"
-        params.append(exclude_id)
-    sql += " LIMIT 1"
-    return con.execute(sql, params).fetchone()
+def get_article(store: RadarStore, article_hash: str) -> dict | None:
+    resp = store.table.get_item(Key={"pk": f"ARTICLE#{article_hash}", "sk": "METADATA"})
+    item = resp.get("Item")
+    return _clean(item) if item else None
 
 
-def find_by_raw_link(
-    con: sqlite3.Connection,
-    raw_link: str,
-) -> sqlite3.Row | None:
-    """Look up an article by its raw (unresolved) feed link.
+def find_by_article_hash(store: RadarStore, article_hash: str, exclude_hash: str | None = None) -> dict | None:
+    # article_hash is the table's own partition key, so a lookup can only
+    # ever return the row whose hash equals the query — if that's also the
+    # excluded hash, there's nothing else it could match. (This mirrors the
+    # old SQLite behavior, where the same exclude-self check against a
+    # UNIQUE column was likewise always a no-op — preserved for parity.)
+    if exclude_hash is not None and article_hash == exclude_hash:
+        return None
+    item = get_article(store, article_hash)
+    # An article already marked irrelevant doesn't count as "already seen"
+    # for dedup purposes — matches the old `AND summary_status != 'irrelevant'`
+    # clause on this lookup in the SQLite version.
+    if item is not None and item.get("summary_status") == "irrelevant":
+        return None
+    return item
 
-    Used by the collect stage as a fast-path dedup BEFORE invoking the
-    Google News resolver — see the comment in collector.py:_process_source
-    for why this matters.
-    """
+
+def find_by_raw_link(store: RadarStore, raw_link: str) -> dict | None:
     if not raw_link:
         return None
-    return con.execute(
-        "SELECT id, article_hash, raw_link, link FROM articles "
-        "WHERE raw_link = ? LIMIT 1",
-        (raw_link,),
-    ).fetchone()
+    raw_hash = _md5(raw_link)
+    resp = store.table.query(
+        IndexName="DedupIndex",
+        KeyConditionExpression=Key("gsi3pk").eq(f"RAWLINK#{raw_hash}"),
+        Limit=1,
+    )
+    items = resp.get("Items", [])
+    if not items:
+        return None
+    return get_article(store, items[0]["article_hash"])
 
 
 def find_by_title_hash_within(
-    con: sqlite3.Connection,
+    store: RadarStore,
     title_hash: str,
     since_ts: str,
-    exclude_id: int | None = None,
-) -> sqlite3.Row | None:
-    sql = (
-        "SELECT * FROM articles "
-        "WHERE title_hash = ? AND published_at >= ? "
-        "AND summary_status != 'irrelevant'"
-    )
-    params: list[Any] = [title_hash, since_ts]
-    if exclude_id is not None:
-        sql += " AND id != ?"
-        params.append(exclude_id)
-    sql += " ORDER BY published_at DESC LIMIT 1"
-    return con.execute(sql, params).fetchone()
-
-
-def candidate_titles_within(
-    con: sqlite3.Connection,
-    since_ts: str,
-    exclude_id: int | None = None,
-) -> list[sqlite3.Row]:
-    sql = (
-        "SELECT id, article_hash, title FROM articles "
-        "WHERE published_at >= ? AND summary_status != 'irrelevant'"
-    )
-    params: list[Any] = [since_ts]
-    if exclude_id is not None:
-        sql += " AND id != ?"
-        params.append(exclude_id)
-    return con.execute(sql, params).fetchall()
-
-
-def knn_within(
-    con: sqlite3.Connection,
-    embedding: list[float],
-    since_ts: str,
-    top_k: int,
-    exclude_id: int | None = None,
-) -> list[sqlite3.Row]:
-    sql = (
-        "SELECT v.rowid, v.distance, a.article_hash, a.title, a.action_description "
-        "FROM vec_articles v "
-        "JOIN articles a ON a.id = v.rowid "
-        "WHERE v.embedding MATCH ? AND k = ? "
-        "AND a.published_at >= ? "
-        "AND a.summary_status != 'irrelevant'"
-    )
-    params: list[Any] = [json.dumps(embedding), top_k, since_ts]
-    if exclude_id is not None:
-        sql += " AND a.id != ?"
-        params.append(exclude_id)
-    sql += " ORDER BY v.distance"
-    return con.execute(sql, params).fetchall()
-
-
-def fts5_search_within(
-    con: sqlite3.Connection,
-    query_text: str,
-    since_ts: str,
-    top_k: int,
-    exclude_id: int | None = None,
-) -> list[sqlite3.Row]:
-    fts_query = " OR ".join(f'"{w}"' for w in query_text.split() if len(w) > 1)
-    if not fts_query:
-        return []
-    sql = (
-        "SELECT a.id, a.article_hash, a.title, fts.rank "
-        "FROM articles_fts fts "
-        "JOIN articles a ON a.id = fts.rowid "
-        "WHERE articles_fts MATCH ? AND a.published_at >= ? "
-        "AND a.summary_status != 'irrelevant'"
-    )
-    params: list[Any] = [fts_query, since_ts]
-    if exclude_id is not None:
-        sql += " AND a.id != ?"
-        params.append(exclude_id)
-    sql += " ORDER BY fts.rank LIMIT ?"
-    params.append(top_k)
-    return con.execute(sql, params).fetchall()
-
-
-def insert_vector(con: sqlite3.Connection, article_id: int, embedding: list[float]) -> None:
-    con.execute("DELETE FROM vec_articles WHERE rowid = ?", (article_id,))
-    con.execute(
-        "INSERT INTO vec_articles(rowid, embedding) VALUES (?, ?)",
-        (article_id, json.dumps(embedding)),
-    )
-
-
-# ----- collection runs -----
-
-def insert_collection_run(con: sqlite3.Connection, run) -> None:
-    con.execute(
-        """INSERT INTO collection_runs(
-            run_id, source_id, source_name, executed_at, mode,
-            status, items_found, items_new, duration_ms, error_message
-        ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (
-            run.run_id, run.source_id, run.source_name, run.executed_at,
-            run.mode, run.status, run.items_found, run.items_new,
-            run.duration_ms, run.error_message,
+    exclude_hash: str | None = None,
+) -> dict | None:
+    resp = store.table.query(
+        IndexName="DedupIndex",
+        KeyConditionExpression=(
+            Key("gsi3pk").eq(f"TITLEHASH#{title_hash}") & Key("gsi3sk").gte(since_ts)
         ),
+        ScanIndexForward=False,
     )
+    for item in resp.get("Items", []):
+        if exclude_hash and item.get("article_hash") == exclude_hash:
+            continue
+        if item.get("summary_status") == "irrelevant":
+            continue
+        return _clean(item)
+    return None
 
 
-# ----- query helpers -----
-
-def pending_articles(
-    con: sqlite3.Connection, limit: int | None = None
-) -> list[dict[str, Any]]:
-    q = (
-        "SELECT a.*, s.feed_type FROM articles a "
-        "LEFT JOIN sources s ON s.source_id = a.source_id "
-        "WHERE a.summary_status = 'pending' "
-        "AND a.category IN ('auto','economia') "
-        "AND (a.dedup_decision IS NULL OR a.dedup_decision != 'duplicate') "
-        "ORDER BY a.collected_at"
-    )
+def pending_articles(store: RadarStore, limit: int | None = None) -> list[dict]:
+    kwargs: dict[str, Any] = {
+        "IndexName": "PendingIndex",
+        "KeyConditionExpression": Key("gsi4pk").eq("PENDING"),
+        "FilterExpression": (
+            Attr("category").is_in(["auto", "economia"])
+            & (Attr("dedup_decision").not_exists() | Attr("dedup_decision").ne("duplicate"))
+        ),
+    }
+    items: list[dict] = []
+    resp = store.table.query(**kwargs)
+    items.extend(resp.get("Items", []))
+    while "LastEvaluatedKey" in resp:
+        resp = store.table.query(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
+        items.extend(resp.get("Items", []))
+    items.sort(key=lambda i: i.get("collected_at", ""))
     if limit:
-        q += f" LIMIT {limit}"
-    return [dict(r) for r in con.execute(q).fetchall()]
+        items = items[:limit]
+    return [_clean(i) for i in items]
 
 
-def article_count(con: sqlite3.Connection) -> int:
-    return con.execute(
-        "SELECT COUNT(*) FROM articles WHERE summary_status != 'irrelevant'"
-    ).fetchone()[0]
-
-
-def article_count_by_status(con: sqlite3.Connection) -> dict[str, int]:
-    rows = con.execute(
-        "SELECT summary_status, COUNT(*) as cnt FROM articles GROUP BY summary_status"
-    ).fetchall()
-    return {r[0]: r[1] for r in rows}
-
-
-def article_count_by_category(con: sqlite3.Connection) -> dict[str, int]:
-    rows = con.execute(
-        "SELECT category, COUNT(*) as cnt FROM articles "
-        "WHERE summary_status != 'irrelevant' GROUP BY category"
-    ).fetchall()
-    return {r[0]: r[1] for r in rows}
-
-
-def mark_article_irrelevant(con: sqlite3.Connection, article_id: int) -> None:
-    con.execute(
-        "UPDATE articles SET summary_status = 'irrelevant' WHERE id = ?",
-        (article_id,),
+def latest_articles(store: RadarStore, limit: int = 20) -> list[dict]:
+    resp = store.table.query(
+        IndexName="LatestIndex",
+        KeyConditionExpression=Key("gsi2pk").eq("ARTICLE"),
+        ScanIndexForward=False,
+        Limit=limit,
     )
+    return [_clean(i) for i in resp.get("Items", [])]
 
 
-def mark_article_failed(con: sqlite3.Connection, article_id: int, error: str = "") -> None:
-    con.execute(
-        "UPDATE articles SET summary_status = 'failed', extra = ? WHERE id = ?",
-        (error, article_id),
-    )
+def articles_for_company(
+    store: RadarStore,
+    company: str,
+    since_ts: str,
+    until_ts: str | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    key_cond = Key("gsi1pk").eq(f"COMPANY#{company}")
+    if until_ts:
+        key_cond &= Key("gsi1sk").between(since_ts, f"{until_ts}￿")
+    else:
+        key_cond &= Key("gsi1sk").gte(since_ts)
+    kwargs: dict[str, Any] = {
+        "IndexName": "CompanyTimeIndex",
+        "KeyConditionExpression": key_cond,
+        "ScanIndexForward": False,
+    }
+    if limit:
+        kwargs["Limit"] = limit
+    resp = store.table.query(**kwargs)
+    return [_clean(i) for i in resp.get("Items", [])]
+
+
+def articles_for_companies(
+    store: RadarStore,
+    companies: list[str],
+    since_ts: str,
+    until_ts: str | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    # DynamoDB Query takes one partition-key value at a time, so an OR
+    # filter across companies fans out into one Query per company and merges
+    # the (already time-sorted) results in Python, deduping on article_hash
+    # in case an article is linked to more than one of the selected companies.
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for company in companies:
+        for item in articles_for_company(store, company, since_ts, until_ts, limit):
+            if item["article_hash"] in seen:
+                continue
+            seen.add(item["article_hash"])
+            merged.append(item)
+    merged.sort(key=lambda i: i.get("published_at", ""), reverse=True)
+    return merged[:limit] if limit else merged
+
+
+def mark_article_irrelevant(store: RadarStore, article_hash: str) -> None:
+    update_article(store, article_hash, summary_status="irrelevant")
+
+
+def mark_article_failed(store: RadarStore, article_hash: str, error: str = "") -> None:
+    update_article(store, article_hash, summary_status="failed", extra=error)
+
+
+def _scan_base_items(store: RadarStore) -> list[dict]:
+    kwargs: dict[str, Any] = {"FilterExpression": Attr("sk").eq("METADATA")}
+    items: list[dict] = []
+    resp = store.table.scan(**kwargs)
+    items.extend(resp.get("Items", []))
+    while "LastEvaluatedKey" in resp:
+        resp = store.table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
+        items.extend(resp.get("Items", []))
+    return items
+
+
+def article_count(store: RadarStore) -> int:
+    return sum(1 for i in _scan_base_items(store) if i.get("summary_status") != "irrelevant")
+
+
+def article_count_by_status(store: RadarStore) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for i in _scan_base_items(store):
+        status = i.get("summary_status", "")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def article_count_by_category(store: RadarStore) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for i in _scan_base_items(store):
+        if i.get("summary_status") == "irrelevant":
+            continue
+        category = i.get("category", "")
+        counts[category] = counts.get(category, 0) + 1
+    return counts
