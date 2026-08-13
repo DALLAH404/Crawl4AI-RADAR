@@ -107,6 +107,16 @@ def cmd_summarize(store, config, metrics: MetricsCollector) -> None:
     )
 
 
+def cmd_retry_failed(store, config, metrics: MetricsCollector) -> None:
+    from radar_pipeline.db import retry_failed_articles
+
+    run = metrics.start("retry-failed")
+    print("Resetting failed articles back to pending...")
+    reset = retry_failed_articles(store)
+    run.finish(reset=reset)
+    print(f"Done: {reset} article(s) reset to pending (will be retried on the next --summarize)")
+
+
 def cmd_classify(store, config, metrics: MetricsCollector) -> None:
     from radar_pipeline.classify.rules import classify_article
     from radar_pipeline.db import pending_articles, update_article
@@ -202,6 +212,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fetch", action="store_true", help="Crawl articles that have a URL")
     p.add_argument("--dedup", action="store_true", help="Run dedup on pending articles")
     p.add_argument("--summarize", action="store_true", help="Summarize pending articles via LLM")
+    p.add_argument(
+        "--retry-failed", action="store_true",
+        help="Reset articles whose summarize call failed back to pending, so the "
+        "next --summarize retries them (a failed article is never retried "
+        "automatically otherwise)",
+    )
     p.add_argument("--status", action="store_true", help="Print source and article statistics")
     p.add_argument(
         "--validate-feeds", action="store_true",
@@ -250,7 +266,7 @@ def main() -> None:
 
     stage_flags = [
         args.collect, args.classify, args.fetch,
-        args.dedup, args.summarize, args.status,
+        args.dedup, args.retry_failed, args.summarize, args.status,
         args.validate_feeds, args.sources_action is not None,
     ]
     run_default = not any(stage_flags)
@@ -264,7 +280,10 @@ def main() -> None:
     # outbound feed URLs — never the store — so they shouldn't need a
     # DynamoDB connection (or a region/credentials) at all. Connect lazily,
     # only for the stages that actually read or write articles.
-    needs_store = args.collect or args.classify or args.fetch or args.dedup or args.summarize or args.status
+    needs_store = (
+        args.collect or args.classify or args.fetch or args.dedup
+        or args.retry_failed or args.summarize or args.status
+    )
     store = None
     if needs_store:
         # RADAR_TABLE_NAME lets the same image target a different table per
@@ -294,6 +313,9 @@ def main() -> None:
 
         if args.dedup:
             cmd_dedup(store, config, metrics)
+
+        if args.retry_failed:
+            cmd_retry_failed(store, config, metrics)
 
         if args.summarize:
             cmd_summarize(store, config, metrics)

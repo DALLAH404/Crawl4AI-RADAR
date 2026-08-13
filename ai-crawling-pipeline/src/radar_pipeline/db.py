@@ -11,8 +11,11 @@ Item types (all in the one `radar-articles` table):
     Base article    pk=ARTICLE#<hash>          sk=METADATA
                      gsi2pk=ARTICLE             gsi2sk=<ts>#<hash>   (LatestIndex)
                      gsi3pk=TITLEHASH#<hash>    gsi3sk=<ts>#<hash>   (DedupIndex)
-                     gsi4pk=PENDING             gsi4sk=<ts>#<hash>   (PendingIndex,
-                                                                      only while pending)
+                     gsi4pk=STATUS#<status>     gsi4sk=<ts>#<hash>   (PendingIndex,
+                                                                      only while status
+                                                                      is 'pending' or
+                                                                      'failed' — see
+                                                                      retry_failed_articles)
 
     Raw-link pointer pk=ARTICLE#<hash>          sk=RAWLINK#<rawhash>
                      gsi3pk=RAWLINK#<rawhash>   gsi3sk=METADATA      (DedupIndex)
@@ -40,6 +43,8 @@ Public API:
     find_by_raw_link(store, raw_link) -> dict | None
     find_by_title_hash_within(store, title_hash, since_ts, exclude_hash=None) -> dict | None
     pending_articles(store, limit=None) -> list[dict]
+    failed_articles(store, limit=None) -> list[dict]
+    retry_failed_articles(store) -> int
     latest_articles(store, limit=20) -> list[dict]
     articles_for_company(store, company, since_ts, until_ts=None, limit=None) -> list[dict]
     articles_for_companies(store, companies, since_ts, until_ts=None, limit=None) -> list[dict]
@@ -216,8 +221,13 @@ def _base_item(article: Article) -> dict:
     if article.title_hash:
         item["gsi3pk"] = f"TITLEHASH#{article.title_hash}"
         item["gsi3sk"] = f"{ts}#{article.article_hash}"
-    if article.summary_status == "pending":
-        item["gsi4pk"] = "PENDING"
+    if article.summary_status in ("pending", "failed"):
+        # Sparse on purpose, same as the other GSIs — only articles that
+        # might still need work sit in this index. 'failed' is included
+        # (not just 'pending') so retry_failed_articles() has something to
+        # query without a full-table Scan; 'ai_generated'/'irrelevant' are
+        # terminal and never revisited via this GSI.
+        item["gsi4pk"] = f"STATUS#{article.summary_status}"
         item["gsi4sk"] = f"{article.collected_at}#{article.article_hash}"
     return {k: v for k, v in item.items() if v not in (None, "")}
 
@@ -369,10 +379,10 @@ def find_by_title_hash_within(
     return None
 
 
-def pending_articles(store: RadarStore, limit: int | None = None) -> list[dict]:
+def _status_queue(store: RadarStore, status: str, limit: int | None = None) -> list[dict]:
     kwargs: dict[str, Any] = {
         "IndexName": "PendingIndex",
-        "KeyConditionExpression": Key("gsi4pk").eq("PENDING"),
+        "KeyConditionExpression": Key("gsi4pk").eq(f"STATUS#{status}"),
         "FilterExpression": (
             Attr("category").is_in(["auto", "economia"])
             & (Attr("dedup_decision").not_exists() | Attr("dedup_decision").ne("duplicate"))
@@ -388,6 +398,29 @@ def pending_articles(store: RadarStore, limit: int | None = None) -> list[dict]:
     if limit:
         items = items[:limit]
     return [_clean(i) for i in items]
+
+
+def pending_articles(store: RadarStore, limit: int | None = None) -> list[dict]:
+    return _status_queue(store, "pending", limit)
+
+
+def failed_articles(store: RadarStore, limit: int | None = None) -> list[dict]:
+    """Articles whose last summarize attempt failed (LLM error, quota, etc.) —
+    retry candidates. These sit in the same sparse GSI as pending_articles
+    (STATUS#failed instead of STATUS#pending) so finding them costs a Query,
+    not a table Scan."""
+    return _status_queue(store, "failed", limit)
+
+
+def retry_failed_articles(store: RadarStore) -> int:
+    """Reset every failed article back to 'pending' so the next --summarize
+    picks it up again. Without this, a failed summarize call is permanent —
+    mark_article_failed drops the article out of the pending queue for good,
+    with no automatic retry. Returns the number of articles reset."""
+    articles = failed_articles(store)
+    for article in articles:
+        update_article(store, article["article_hash"], summary_status="pending")
+    return len(articles)
 
 
 def latest_articles(store: RadarStore, limit: int = 20) -> list[dict]:

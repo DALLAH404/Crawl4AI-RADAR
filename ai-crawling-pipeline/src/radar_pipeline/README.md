@@ -285,7 +285,13 @@ Behaviour:
   `summary_status='irrelevant'` via `mark_article_irrelevant` and skipped from
   the JSON writer. Non-relevant articles therefore never appear under
   `outputs/radar/processed/`.
-- **Failed LLM calls** — `summary_status='failed'` via `mark_article_failed`.
+- **Failed LLM calls** — `summary_status='failed'` via `mark_article_failed`. This is
+  permanent until acted on: a failed article drops out of the pending queue and is
+  never automatically retried on a later run. Run `radar-pipeline --retry-failed`
+  (typically followed by `--summarize` in the same invocation) to reset every failed
+  article back to `pending` and give it another attempt — see
+  [Database layer](#database-layer--dbpy) for how the retry queue is found without a
+  table Scan.
 
 ## Configuration
 
@@ -320,6 +326,7 @@ Output paths were deliberately moved from the shared `outputs/` tree to
 | `--classify`        | Re-run the keyword classifier over pending articles.         |
 | `--fetch`           | Crawl pending articles' URLs.                                |
 | `--dedup`           | Run the 2-layer dedup pass over pending articles.            |
+| `--retry-failed`    | Reset articles whose summarize call failed back to `pending`, so the next `--summarize` retries them. Not automatic — never runs as part of the default sequence. |
 | `--summarize`       | Summarize pending (non-duplicate) articles.                  |
 | `--status`          | Print source and article statistics (read-only).             |
 | `--validate-feeds`  | Probe every active source URL without inserting any rows. LinkedIn sources are printed `[SKIP]` — httpx probing is meaningless against a browser-rendered page; use `--collect` to actually validate them. |
@@ -386,7 +393,7 @@ every read):
 |---|---|---|---|
 | **Base article** | `pk=ARTICLE#<hash>` `sk=METADATA` | `LatestIndex`: `gsi2pk=ARTICLE, gsi2sk=<ts>#<hash>` | Every article field; "latest N overall" |
 | | | `DedupIndex`: `gsi3pk=TITLEHASH#<title_hash>, gsi3sk=<ts>#<hash>` | Layer 1 title-hash dedup within a window |
-| | | `PendingIndex`: `gsi4pk=PENDING, gsi4sk=<ts>#<hash>` (only while `summary_status='pending'`) | `pending_articles()` without scanning the whole table |
+| | | `PendingIndex`: `gsi4pk=STATUS#<status>, gsi4sk=<ts>#<hash>` (only while `summary_status` is `pending` or `failed`) | `pending_articles()` / `failed_articles()` without scanning the whole table |
 | **Raw-link pointer** | `pk=ARTICLE#<hash>` `sk=RAWLINK#<rawhash>` | `DedupIndex`: `gsi3pk=RAWLINK#<rawhash>, gsi3sk=METADATA` | `find_by_raw_link` — the fast pre-resolve dedup check |
 | **Company link** | `pk=ARTICLE#<hash>` `sk=COMPANY#<tag>` | `CompanyTimeIndex`: `gsi1pk=COMPANY#<tag>, gsi1sk=<ts>#<hash>` | Per-company timeline (denormalized display fields, one item per company an article is relevant to) |
 
@@ -405,6 +412,21 @@ isn't persisted at all (CloudWatch Logs from the Fargate task covers it; see
 from dedup before this migration — see [Removed layers](#removed-layers-preserved-implementation)),
 and DynamoDB has no equivalent of either (would need OpenSearch to bring them back,
 which is out of scope here).
+
+### Retrying failed summarize attempts
+
+`PendingIndex` is sparse on `summary_status`, but not sparse to just one value —
+both `pending` and `failed` articles carry a `gsi4pk`, as `STATUS#pending` /
+`STATUS#failed` respectively (`ai_generated`/`irrelevant` are terminal and carry
+neither, so they're never indexed here at all). `pending_articles()` and
+`failed_articles()` are the same query against the same GSI, just a different
+`gsi4pk` value. This is what makes `retry_failed_articles()` — reset every failed
+article's `summary_status` back to `pending` — a `Query` plus one `update_article`
+per result, not a table `Scan`: the failed set is exactly as cheap to find as the
+pending set, regardless of how large the table has grown. `radar-pipeline
+--retry-failed` is the CLI entry point; nothing calls it automatically, since an
+article that fails for a persistent reason (bad content, not a transient API
+hiccup) would otherwise retry forever on every scheduled run.
 
 ### Multi-company reads
 
@@ -694,6 +716,10 @@ uv run radar-pipeline --collect --companies bosch,valeo --hours-back 3
 
 # wide manual catch-up instead of the normal schedule window
 uv run radar-pipeline --collect --backfill
+
+# give up-front-failed summarize attempts another shot (e.g. after an LLM
+# quota/outage clears), then actually retry them in the same invocation
+uv run radar-pipeline --retry-failed --summarize
 ```
 
 Point `db.endpoint_url` (in the config, or `--endpoint-url` on

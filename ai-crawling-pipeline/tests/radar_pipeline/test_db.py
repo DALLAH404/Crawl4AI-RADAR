@@ -7,15 +7,18 @@ from datetime import datetime, timezone
 from boto3.dynamodb.conditions import Key
 
 from radar_pipeline.db import (
+    failed_articles,
     find_by_article_hash,
     find_by_raw_link,
     find_by_title_hash_within,
     get_article,
     latest_articles,
+    mark_article_failed,
     mark_article_irrelevant,
     articles_for_company,
     pending_articles,
     put_article,
+    retry_failed_articles,
     update_article,
 )
 from radar_pipeline.models import Article
@@ -151,6 +154,38 @@ class TestArticles:
 
         update_article(store, "to-summarize", summary_status="ai_generated")
         assert len(pending_articles(store)) == 0
+
+    def test_failed_article_leaves_pending_and_enters_failed_queue(self, store):
+        put_article(store, _make_article(article_hash="will-fail", link="https://example.com/fail"))
+        assert len(pending_articles(store)) == 1
+
+        mark_article_failed(store, "will-fail", "LLM quota exceeded")
+
+        assert len(pending_articles(store)) == 0
+        failed = failed_articles(store)
+        assert len(failed) == 1
+        assert failed[0]["article_hash"] == "will-fail"
+        assert failed[0]["extra"] == "LLM quota exceeded"
+
+    def test_retry_failed_articles_moves_them_back_to_pending(self, store):
+        put_article(store, _make_article(article_hash="retry-me", link="https://example.com/retry"))
+        mark_article_failed(store, "retry-me", "transient error")
+        assert len(pending_articles(store)) == 0
+        assert len(failed_articles(store)) == 1
+
+        reset_count = retry_failed_articles(store)
+
+        assert reset_count == 1
+        assert len(failed_articles(store)) == 0
+        pending = pending_articles(store)
+        assert len(pending) == 1
+        assert pending[0]["article_hash"] == "retry-me"
+        assert pending[0]["summary_status"] == "pending"
+
+    def test_retry_failed_articles_is_a_noop_with_nothing_failed(self, store):
+        put_article(store, _make_article(article_hash="fine", link="https://example.com/fine"))
+        assert retry_failed_articles(store) == 0
+        assert len(pending_articles(store)) == 1
 
     def test_latest_articles_ordering(self, store):
         put_article(store, _make_article(article_hash="older", link="https://example.com/1", published_at="2026-08-01"))
