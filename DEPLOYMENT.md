@@ -386,19 +386,35 @@ config below, just point `subnets` at private subnets that have a NAT Gateway ro
    `summarize.llm.base_url` points at are all reached over HTTPS, but feed URLs are
    occasionally plain HTTP, so restricting to 443 alone can silently break a source.
    If you want it tighter than "all traffic," allow **443/tcp** and **80/tcp** to
-   `0.0.0.0/0` specifically and watch `--validate-feeds` / CloudWatch logs for
-   anything that still fails to connect.
+   `0.0.0.0/0` specifically — and also **53/tcp+udp** (DNS) to `0.0.0.0/0`, or
+   nothing will resolve at all (Amazon's VPC-provided DNS resolver is still subject
+   to the security group's egress rules; it's easy to restrict to "web ports" and
+   forget DNS isn't one of them). Watch `--validate-feeds` / CloudWatch logs for
+   anything that still fails to connect either way.
 5. **Create security group**. Note the security group ID (`sg-...`).
 
-**Find your subnet IDs**: VPC → **Subnets** → filter by your VPC → note two subnet
-IDs in different Availability Zones that have **Auto-assign public IPv4 address**
-enabled (public subnets in the default VPC have this on already). If none do, edit
-one: select it → **Actions** → **Edit subnet settings** → enable auto-assign public
-IPv4.
+**Find your subnet IDs, and confirm they're actually public — two separate things**:
+VPC → **Subnets** → filter by your VPC → note two subnet IDs in different
+Availability Zones that have **Auto-assign public IPv4 address** enabled. That
+setting alone is *not* sufficient — it only controls whether the task's network
+interface gets a public IP attached, not whether that IP can reach anywhere. For
+each candidate subnet, also check its **Route table** tab (or VPC → **Route Tables**
+→ find the one associated with that subnet) for a `0.0.0.0/0` route targeting an
+**Internet Gateway** (`igw-...`, not a NAT Gateway, and not absent). A subnet that
+auto-assigns a public IP but routes through a NAT Gateway (or has no default route
+at all) is a private subnet by the definition that matters here — the task will
+start, get a public IP, and then time out trying to reach anything, including SSM
+for its own secrets (see the Phase 5 troubleshooting note below for exactly this
+failure). Public subnets in the *default* VPC have both properties already; a
+custom VPC needs checking, and possibly creating/attaching an Internet Gateway and
+adding the route yourself if it's missing.
 
 **Confirm it worked**: `aws ec2 describe-security-groups --group-ids <sg-id>
 --query 'SecurityGroups[0].{Inbound:IpPermissions,Outbound:IpPermissionsEgress}'`
-shows an empty inbound list and a non-empty outbound list.
+shows an empty inbound list and a non-empty outbound list. For the subnet/route
+table: `aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=<subnet-id>" --query 'RouteTables[0].Routes'`
+should include a row with `DestinationCidrBlock: 0.0.0.0/0` and a `GatewayId`
+starting `igw-`.
 
 ### 2. IAM role for EventBridge Scheduler
 
@@ -663,6 +679,39 @@ If the company query in the first command comes back empty but the latest-overal
 query doesn't, check that the company tag matches `configs/radar_sources.yaml`'s
 `tag:` field exactly (case-sensitive) — that's the most common reason for an
 otherwise-successful run to look empty from one angle only.
+
+### Troubleshooting: `ResourceInitializationError` pulling secrets/registry auth
+
+**Symptom**: the task stops immediately with something like `unable to pull secrets
+or registry auth: unable to retrieve secrets from ssm: ... context deadline
+exceeded`, before any application log lines appear.
+
+**Cause**: the task's network interface can't reach the SSM (and/or ECR) endpoint at
+all — this happens during resource initialization, before the container even starts,
+so it's a pure networking problem, not a permissions or app-code one. The specific
+case this bit during initial rollout: the subnet had **Auto-assign public IPv4
+address** enabled and the task *did* get a public IP, but the subnet's route table
+had no `0.0.0.0/0 -> igw-...` route — so that public IP had nothing to route through.
+Auto-assign-IP and "is actually a public subnet" are two different, both-required
+properties; see the corrected guidance in Phase 4's networking section above.
+
+**Fix**: confirm an Internet Gateway is attached to the VPC, then add the missing
+route to the subnet's route table:
+
+```bash
+aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=<vpc-id>" --region <REGION>
+# if empty, create and attach one:
+aws ec2 create-internet-gateway --region <REGION>
+aws ec2 attach-internet-gateway --internet-gateway-id <igw-id> --vpc-id <vpc-id> --region <REGION>
+
+aws ec2 create-route --route-table-id <rtb-id> --destination-cidr-block 0.0.0.0/0 --gateway-id <igw-id> --region <REGION>
+```
+
+Re-run the task (step 1 above) once `describe-route-tables` shows the route.
+
+If that's not it: also check the security group actually allows the outbound traffic
+(covered in Phase 4), and that DNS resolution is enabled for the VPC
+(`enableDnsSupport`/`enableDnsHostnames`, both on by default and rarely the culprit).
 
 ---
 
