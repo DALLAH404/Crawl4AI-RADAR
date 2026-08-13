@@ -1,12 +1,18 @@
-"""Markdown writer for fetched articles.
+"""Writer for fetched articles — local disk or S3, same Markdown shape.
 
-Produces outputs/radar/raw/<slug>.md with YAML front-matter compatible
-with the dedup and summary stages.
+Produces `<slug>.md` with YAML front-matter compatible with the dedup and
+summary stages. `write_article_md` (local disk) is used when no S3 bucket
+is configured (`fetch.s3` in config); `upload_article_md` (S3) is used when
+it is, organized one folder per fetch run:
+
+    <prefix>/<run_timestamp>/<source_id>/<slug>.md
+
+Local disk on Fargate is ephemeral — gone the moment the task stops — so
+S3 is what makes a fetch run's actual scraped content durable across runs.
 """
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
 
@@ -34,6 +40,36 @@ def make_slug(source_id: str, article_hash: str, title: str) -> str:
     return slug[:100]
 
 
+def render_article_markdown(
+    article_hash: str,
+    source_id: str,
+    title: str,
+    url: str,
+    markdown: str,
+    category: str = "auto",
+    tag: str = "",
+    product_line: str = "Geral",
+    event_type: str = "",
+    alert_level: str = "",
+    date: str = "",
+    image_url: str = "",
+) -> str:
+    front = YAML_FRONT_MATTER.format(
+        id_hash=article_hash,
+        source=source_id,
+        category=category,
+        tag=tag,
+        product_line=product_line,
+        event_type=event_type,
+        alert_level=alert_level,
+        date=date,
+        image_url=image_url,
+        url=url,
+    )
+    body = f"# {title}\n\nURL: {url}\n\n{markdown}"
+    return front + body
+
+
 def write_article_md(
     output_dir: Path,
     source_id: str,
@@ -53,19 +89,51 @@ def write_article_md(
     slug = make_slug(source_id, article_hash, title)
     out_path = output_dir / f"{slug}.md"
 
-    front = YAML_FRONT_MATTER.format(
-        id_hash=article_hash,
-        source=source_id,
-        category=category,
-        tag=tag,
-        product_line=product_line,
-        event_type=event_type,
-        alert_level=alert_level,
-        date=date,
-        image_url=image_url,
-        url=url,
+    content = render_article_markdown(
+        article_hash=article_hash, source_id=source_id, title=title, url=url,
+        markdown=markdown, category=category, tag=tag, product_line=product_line,
+        event_type=event_type, alert_level=alert_level, date=date, image_url=image_url,
     )
-
-    body = f"# {title}\n\nURL: {url}\n\n{markdown}"
-    out_path.write_text(front + body, encoding="utf-8")
+    out_path.write_text(content, encoding="utf-8")
     return out_path
+
+
+def s3_key_for_run(
+    prefix: str, run_timestamp: str, source_id: str, article_hash: str, title: str
+) -> str:
+    slug = make_slug(source_id, article_hash, title)
+    return f"{prefix}/{run_timestamp}/{source_id}/{slug}.md"
+
+
+def upload_article_md(
+    s3_client,
+    bucket: str,
+    prefix: str,
+    run_timestamp: str,
+    source_id: str,
+    article_hash: str,
+    title: str,
+    url: str,
+    markdown: str,
+    category: str = "auto",
+    tag: str = "",
+    product_line: str = "Geral",
+    event_type: str = "",
+    alert_level: str = "",
+    date: str = "",
+    image_url: str = "",
+) -> str:
+    """Upload one article's rendered Markdown to S3. Returns the object key."""
+    key = s3_key_for_run(prefix, run_timestamp, source_id, article_hash, title)
+    content = render_article_markdown(
+        article_hash=article_hash, source_id=source_id, title=title, url=url,
+        markdown=markdown, category=category, tag=tag, product_line=product_line,
+        event_type=event_type, alert_level=alert_level, date=date, image_url=image_url,
+    )
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=content.encode("utf-8"),
+        ContentType="text/markdown; charset=utf-8",
+    )
+    return key

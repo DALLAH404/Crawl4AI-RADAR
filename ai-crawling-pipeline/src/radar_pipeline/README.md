@@ -153,7 +153,9 @@ only the DB integration is new here.
 ### 2. Fetch — `fetch/crawl.py:fetch_articles`
 
 Crawls the pending articles' resolved URLs with **Crawl4AI** and writes the page
-content as Markdown to `outputs/radar/raw/<source_id>/<source_id>_<hash8>.md`.
+content as Markdown — to S3 (one folder per fetch run) if `fetch.s3` is configured,
+otherwise to local disk at `outputs/radar/raw/<source_id>/<source_id>_<hash8>.md` (see
+[S3 archive of fetched content](#s3-archive-of-fetched-content) below).
 
 - **Pending source** — `pending_articles(store)` queries the `PendingIndex` GSI
   (sparse: only items with `summary_status = 'pending'`) and filters to
@@ -166,8 +168,9 @@ content as Markdown to `outputs/radar/raw/<source_id>/<source_id>_<hash8>.md`.
   the og:image fetch below. LinkedIn authwalls individual `/posts/` URLs for
   logged-out crawlers, so there's nothing fetchable there, and the full post text
   was already captured at collect time (`Article.action_description`). The
-  collected text is archived straight to `outputs/radar/raw/<source_id>/*.md` via
-  the same `write_article_md`, counted as `fetched`, at zero network cost.
+  collected text is archived through the same `_save_article_md` path as every
+  other source (S3 or local disk, whichever is configured), counted as `fetched`,
+  at zero network cost.
 - **Browser config** — `BrowserConfig(**config.browser)` with `headless`
   defaulting to `True` via `setdefault`. The YAML `browser:` block may override
   every option. *Corner case*: a previous implementation passed `headless=True`
@@ -190,13 +193,48 @@ content as Markdown to `outputs/radar/raw/<source_id>/<source_id>_<hash8>.md`.
   wrapped by `ai_crawling_pipeline.anti_block.crawl_with_retry`, which retries
   with backoff, rotated user-agents, and Crawl4AI `magic` / stealth flags based
   on `AntiBlockSettings`.
-- **Output** — `fetch/writer.write_article_md` writes Markdown with YAML
+- **Output** — `fetch/writer.render_article_markdown` builds the Markdown + YAML
   front-matter (`id_hash, source, category, tag, product_line, event_type,
-  alert_level, date, image_url, url`).
+  alert_level, date, image_url, url`) once; `_save_article_md` (in `crawl.py`) then
+  either `upload_article_md`s it to S3 or `write_article_md`s it to local disk,
+  same content either way — see
+  [S3 archive of fetched content](#s3-archive-of-fetched-content).
 - **Failure handling** — any exception in `_fetch_one` is caught and counted as
   `failed`; the pipeline does not abort on per-article failures. Empty markdown
   also counts as `failed`. The article's `image_url` is persisted via
   `update_article(store, article_hash, image_url=...)` (only on success).
+
+#### S3 archive of fetched content
+
+Local disk (`outputs/radar/raw`) is what `fetch_articles` writes to when `fetch.s3`
+isn't configured — fine for local runs, but on Fargate that directory is on the
+task's ephemeral storage and is gone the moment the task stops. Nothing downstream
+reads these files back (`summarize` works from `action_description`/`summary` on the
+DynamoDB article itself, not from the raw Markdown), so without S3 configured, a
+deployed run's actual fetched page content — as opposed to the metadata already in
+DynamoDB — simply isn't kept anywhere once the container exits.
+
+Setting `fetch.s3.bucket` switches the destination to S3 entirely (not
+additionally — local disk is skipped, not double-written), one folder per fetch
+run:
+
+```
+s3://<bucket>/<prefix>/<run_timestamp>/<source_id>/<source_id>_<hash8>.md
+```
+
+`run_timestamp` (`%Y%m%dT%H%M%SZ`, UTC) is generated once per `fetch_articles`
+call — every article fetched in that call lands under the same folder, and a
+different invocation (the next scheduled run, a manual re-run) gets a new one.
+It's a parameter on `fetch_articles` mainly so tests can pin it; the CLI never
+needs to pass one explicitly. `fetch.s3.bucket` can also be set via the
+`RADAR_FETCH_S3_BUCKET` env var (same override pattern as `RADAR_TABLE_NAME` for
+DynamoDB), so the task definition can point at a bucket without a rebuild.
+
+The task role needs `s3:PutObject` on `<bucket>/*` for this — see
+`iam/task-role-policy.json` and `DEPLOYMENT.md`'s S3 section for the bucket-creation
+and IAM steps. Nothing in the app ever reads these objects back, so no
+`s3:GetObject`/`s3:ListBucket` is granted — least privilege in the same spirit as
+the DynamoDB task role scoping.
 
 ### 3. Dedup — `dedup/layers.py`
 
@@ -307,7 +345,9 @@ Behaviour:
 |----------------------|----------------------------------|-----------------------------------------|
 | `db.table_name`      | `radar-articles`                 | DynamoDB table (see below)              |
 | `db.endpoint_url`    | unset                            | Local/dev only — dynamodb-local or moto; unset means real AWS |
-| `fetch.output_dir`   | `outputs/radar/raw`              | Crawl4AI markdown output                |
+| `fetch.output_dir`   | `outputs/radar/raw`              | Crawl4AI markdown output — local disk, used only when `fetch.s3` is unset |
+| `fetch.s3.bucket`    | unset                            | Set to archive fetched Markdown to S3 instead of local disk (see [S3 archive of fetched content](#s3-archive-of-fetched-content)) |
+| `fetch.s3.prefix`    | `raw`                            | S3 key prefix, before the per-run timestamp folder |
 | `summarize.output_dir` | `outputs/radar/processed`       | LLM-summarized JSON output              |
 | `sources.yaml_path`  | `configs/radar_sources.yaml`    | Source catalog (100+ seeds, incl. 13 LinkedIn) |
 
@@ -362,6 +402,8 @@ in that table worth keeping a database for.
 |-----------------|------------------------------------------|
 | `GEMINI_API_KEY`| `GeminiEmbedder` (Layer 3, currently unused). |
 | `OPENAI_API_KEY`| `summarize/client.AsyncOpenAI` and `dedup/judge.judge` (Layer 4, currently unused). |
+| `RADAR_TABLE_NAME` | Overrides `db.table_name` — set per environment via the task definition without rebuilding the image. |
+| `RADAR_FETCH_S3_BUCKET` | Overrides `fetch.s3.bucket` the same way; unset means whatever (if anything) `fetch.s3.bucket` says in the YAML. |
 
 LinkedIn collection needs no API key or credentials — it scrapes public,
 logged-out pages via Crawl4AI's browser automation, same as every other
@@ -517,6 +559,33 @@ browser_kwargs.setdefault("headless", True); BrowserConfig(**browser_kwargs)`.
 The YAML can still override `headless` if it wants; the explicit default only
 fires when the YAML omits the key.
 
+### Bracket access on optional article fields — `KeyError` in fetch
+
+**Symptom**: `fetch/crawl.py` did `article["event_type"] or ""` (and the same for
+`category`, `competitor_tag`, `product_line`, `alert_level`, `source_id`) — caught by
+`_fetch_one`'s blanket `except Exception`, so it never crashed the task, but it
+silently turned every article whose `event_type` (or any of those other fields)
+happened to be empty into a counted `failed` fetch, no markdown written, no
+`image_url` update. `classify_article` returning `""` when no keyword rule matches is
+completely normal, so this was live and firing on a meaningful fraction of real
+articles, not a rare edge case.
+
+**Cause**: under SQLite, every column was always present on a row, empty string or
+not — `row["event_type"]` was always safe. `db._base_item()` strips empty-string
+attributes before storing an item (`{k: v for k, v in item.items() if v not in (None,
+"")}` — no reason to store an empty attribute), so a DynamoDB item is *missing* the
+key entirely when that field is `""`, not carrying an empty value for it. Bracket
+access assumes the key exists; `.get()` doesn't. This was found via a test written
+for the S3 upload path (`test_fetch_crawl_s3.py`) — the first test to actually
+exercise `fetch_articles`'s LinkedIn short-circuit branch end to end with a realistic
+article missing an optional field.
+
+**Fix**: every optional field read in `_fetch_one` uses `article.get(field) or
+default` now, not `article[field] or default`. `article_hash`/`title`/`link` stay as
+bracket access deliberately — those should never legitimately be absent, and a
+`KeyError` there would mean a real data-integrity problem worth surfacing loudly, not
+papering over.
+
 ### Empty `article_hash`
 
 **Symptom**: an article whose URL resolution returned `""` would have
@@ -669,9 +738,11 @@ src/radar_pipeline/
 │   ├── linkedin.py         fetch_company_posts (Crawl4AI); extract_posts/extract_post_media
 │   └── ratelimit.py        RateLimiter + circuit breaker (shared by GNews and LinkedIn)
 ├── fetch/
-│   ├── crawl.py            fetch_articles (Crawl4AI + anti_block retry + og:image)
+│   ├── crawl.py            fetch_articles (Crawl4AI + anti_block retry + og:image;
+│   │                       writes to S3 or local disk via _save_article_md)
 │   ├── image.py            fetch_og_image, BAD_IMG_DOMAINS filter
-│   └── writer.py           write_article_md (Markdown + YAML front-matter)
+│   └── writer.py           render_article_markdown, write_article_md (local),
+│                           upload_article_md (S3), s3_key_for_run
 ├── dedup/
 │   ├── layers.py           Deduper.classify_article (Layer 0 + 1), run_dedup
 │   ├── embedding.py        GeminiEmbedder (PRESERVED, unused)
@@ -733,5 +804,5 @@ uv run python scripts/check_dynamodb_idempotency.py --endpoint-url http://localh
 
 Tests live in `tests/radar_pipeline/` and run via `uv run pytest
 tests/radar_pipeline/ -q`. The suite covers classify, db (against a moto-mocked
-DynamoDB table — see `conftest.py`), collector (RSS and LinkedIn), and the LinkedIn
-extraction layer (126 tests).
+DynamoDB table — see `conftest.py`), collector (RSS and LinkedIn), fetch/S3 output
+(moto-mocked S3), and the LinkedIn extraction layer (136 tests).

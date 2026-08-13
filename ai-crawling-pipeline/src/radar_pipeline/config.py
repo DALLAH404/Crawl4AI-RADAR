@@ -78,11 +78,28 @@ class CollectSettings:
 
 
 @dataclass
+class S3Settings:
+    bucket: str = ""
+    prefix: str = "raw"
+    region_name: str = ""
+    # Set only for local/dev testing (moto, a local S3-compatible endpoint) —
+    # leave empty to use the real AWS endpoint for the configured region.
+    endpoint_url: str = ""
+
+
+@dataclass
 class FetchSettings:
     output_dir: Path = field(default_factory=lambda: Path("outputs/radar/raw"))
     browser: dict[str, Any] = field(default_factory=dict)
     defaults: dict[str, Any] = field(default_factory=dict)
     anti_block: dict[str, Any] | None = None
+    # When set, fetched articles are uploaded to S3 (one folder per run,
+    # keyed on when that fetch stage ran) instead of written to local disk —
+    # local disk on Fargate is ephemeral and gone the moment the task stops,
+    # so this is the durable archive of what was actually scraped. None
+    # (the default) keeps writing to output_dir on local disk, same as before
+    # this existed.
+    s3: S3Settings | None = None
 
 
 @dataclass
@@ -214,11 +231,21 @@ def load_radar_config(yaml_path: str | Path) -> RadarConfig:
 
     fetch = None
     if fetch_r is not None:
+        s3_r = fetch_r.get("s3")
+        s3 = None
+        if s3_r is not None:
+            s3 = S3Settings(
+                bucket=s3_r.get("bucket", S3Settings.bucket),
+                prefix=s3_r.get("prefix", S3Settings.prefix),
+                region_name=s3_r.get("region_name", S3Settings.region_name),
+                endpoint_url=s3_r.get("endpoint_url", S3Settings.endpoint_url),
+            )
         fetch = FetchSettings(
             output_dir=Path(fetch_r.get("output_dir", "outputs/radar/raw")),
             browser=fetch_r.get("browser") or {},
             defaults=fetch_r.get("defaults") or {},
             anti_block=fetch_r.get("anti_block"),
+            s3=s3,
         )
 
     dedup = None

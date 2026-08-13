@@ -49,6 +49,16 @@ collect:
 
 fetch:
   output_dir: outputs/radar/raw
+  # Uncomment and set a bucket to archive fetched articles to S3 instead of
+  # local disk, one folder per fetch run (<prefix>/<run_timestamp>/<source_id>/*.md)
+  # — local disk on Fargate is ephemeral, so this is what makes a run's
+  # scraped content durable. Override the bucket per-environment without
+  # editing this file via the RADAR_FETCH_S3_BUCKET env var.
+  # s3:
+  #   bucket: radar-scraper-raw
+  #   prefix: raw
+  #   # region_name: us-east-1        # defaults to the AWS SDK's usual resolution
+  #   # endpoint_url: http://localhost:9000   # local/dev only (moto, MinIO, etc.)
   browser:
     headless: true
     viewport_width: 1280

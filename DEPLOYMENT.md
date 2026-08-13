@@ -715,5 +715,85 @@ If that's not it: also check the security group actually allows the outbound tra
 
 ---
 
+## Addendum — S3 bucket for raw fetch archives
+
+Added after Phase 5: the fetch stage can now archive each run's fetched Markdown to
+S3 (one folder per run) instead of the task's ephemeral local disk, which was
+otherwise just discarded when the task stopped. See `src/radar_pipeline/README.md`'s
+"S3 archive of fetched content" section for the design; this is the AWS-side setup
+for it. Skip this entirely if you're fine leaving `fetch.s3` unset in
+`configs/radar.yaml` — local disk still works exactly as before, it's just not
+durable across runs.
+
+### 1. Create the bucket
+
+**Console**: S3 → **Create bucket**.
+- **Bucket name**: `radar-scraper-raw` (must be globally unique — append your
+  account ID or a suffix if it's taken).
+- **Region**: same region as everything else in this guide.
+- **Block Public Access settings**: leave all four boxes checked (the default) —
+  nothing in this bucket should ever be public.
+- Leave versioning/encryption at their defaults unless your org requires otherwise.
+- **Create bucket**.
+
+**Confirm it worked**: `aws s3api head-bucket --bucket radar-scraper-raw --region
+<REGION>` returns no error (empty output = success).
+
+**CLI equivalent**:
+
+```bash
+aws s3api create-bucket --bucket radar-scraper-raw --region <REGION> \
+  --create-bucket-configuration LocationConstraint=<REGION>
+aws s3api put-public-access-block --bucket radar-scraper-raw --region <REGION> \
+  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+```
+
+(Omit `--create-bucket-configuration` entirely if `<REGION>` is `us-east-1` — S3's
+API rejects that constructor argument specifically for that region.)
+
+### 2. Update the task role's IAM policy
+
+`iam/task-role-policy.json` already has the `RadarFetchArchiveBucket` statement
+(`s3:PutObject` on `<bucket>/*`, nothing else — nothing in the app ever reads these
+objects back). Fill in the bucket name and re-apply it to the existing
+`radar-scraper-task-role` from Phase 3:
+
+```bash
+cd ai-crawling-pipeline
+sed -i "s/<FETCH_BUCKET_NAME>/radar-scraper-raw/g" iam/task-role-policy.json
+# <ACCOUNT_ID>/<REGION> were already filled in during Phase 3; re-run that sed too
+# if this is a fresh checkout.
+
+aws iam put-role-policy --role-name radar-scraper-task-role \
+  --policy-name radar-scraper-task-policy \
+  --policy-document file://iam/task-role-policy.json \
+  --region <REGION>
+```
+
+**Console equivalent**: IAM → Policies → `radar-scraper-task-policy` → **Edit** →
+**JSON** tab → paste the updated `iam/task-role-policy.json` → **Save changes**. This
+updates the existing policy in place (same name Phase 3 created) — no new role, no
+re-registering the task definition.
+
+**Confirm it worked**: `aws iam get-role-policy --role-name radar-scraper-task-role
+--policy-name radar-scraper-task-policy --query
+'PolicyDocument.Statement[?Sid==`RadarFetchArchiveBucket`]'` returns the statement
+with your real bucket ARN, not a placeholder.
+
+### 3. Point the pipeline at it
+
+Either edit `configs/radar.yaml`'s `fetch.s3.bucket` (uncomment the block already
+there) and rebuild/push the image, or set `RADAR_FETCH_S3_BUCKET` as an environment
+variable on the task definition (`task-definition.json`'s `containerDefinitions[0].environment`,
+same pattern as `RADAR_TABLE_NAME`) — the latter needs no rebuild, just
+`register-task-definition` again with the added variable.
+
+**Confirm it worked**: after the next `--fetch` run (manual trigger per Phase 5, or
+wait for the schedule), `aws s3 ls s3://radar-scraper-raw/raw/ --region <REGION>`
+should show one folder per run, each named like `20260813T090000Z/`, containing one
+`.md` object per source that had pending articles that run.
+
+---
+
 *(Later phases — read API, frontend — will each add their own section here as
 they're built.)*

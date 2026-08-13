@@ -12,7 +12,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from radar_pipeline.config import load_radar_config
+from radar_pipeline.config import S3Settings, load_radar_config
 from radar_pipeline.db import (
     article_count,
     article_count_by_category,
@@ -63,9 +63,18 @@ def cmd_fetch(store, config, metrics: MetricsCollector) -> None:
         print("No fetch section in config; skipping.")
         return
 
+    fetch_settings = config.fetch
+    s3_bucket_override = os.environ.get("RADAR_FETCH_S3_BUCKET")
+    if s3_bucket_override:
+        # Same idea as RADAR_TABLE_NAME — lets the task definition point at
+        # a bucket per environment without rebuilding the image or shipping
+        # a different configs/radar.yaml.
+        s3 = dataclasses.replace(fetch_settings.s3 or S3Settings(), bucket=s3_bucket_override)
+        fetch_settings = dataclasses.replace(fetch_settings, s3=s3)
+
     run = metrics.start("fetch")
     print("Fetching articles...")
-    result = asyncio.run(fetch_articles(store, config.fetch))
+    result = asyncio.run(fetch_articles(store, fetch_settings))
     run.finish(**result)
     print(
         f"Done: {result['total']} pending, {result['fetched']} fetched, "

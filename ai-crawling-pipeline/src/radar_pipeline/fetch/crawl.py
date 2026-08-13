@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 
 from radar_pipeline.db import pending_articles, update_article
 from radar_pipeline.fetch.image import fetch_og_image
-from radar_pipeline.fetch.writer import write_article_md
+from radar_pipeline.fetch.writer import upload_article_md, write_article_md
 from radar_pipeline.sources.gnews import resolve_google_news_url
 
 logger = logging.getLogger(__name__)
@@ -21,18 +22,37 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONCURRENCY = 4
 
 
+def _s3_client(s3_settings):
+    import boto3
+
+    kwargs = {}
+    if s3_settings.region_name:
+        kwargs["region_name"] = s3_settings.region_name
+    if s3_settings.endpoint_url:
+        kwargs["endpoint_url"] = s3_settings.endpoint_url
+    return boto3.client("s3", **kwargs)
+
+
 async def fetch_articles(
     store,
     config,
     concurrency: int = DEFAULT_CONCURRENCY,
+    run_timestamp: str | None = None,
 ) -> dict[str, int]:
     articles = pending_articles(store)
     if not articles:
         logger.info("No pending articles to fetch")
         return {"total": 0, "fetched": 0, "failed": 0}
 
+    s3_settings = config.s3 if config else None
+    s3_client = _s3_client(s3_settings) if s3_settings and s3_settings.bucket else None
+    # One timestamp for every article this call fetches, so they all land
+    # under the same run folder in S3 — computed once here, not per-article.
+    run_timestamp = run_timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
     output_dir = config.output_dir if config else Path("outputs/radar/raw")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if s3_client is None:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     browser_kwargs = dict(config.browser) if config else {}
     browser_kwargs.setdefault("headless", True)
@@ -45,6 +65,16 @@ async def fetch_articles(
     fetched = 0
     failed = 0
 
+    def _save_article_md(**kwargs) -> None:
+        # Same content either way (render_article_markdown) — this just
+        # decides where it lands. S3 wins when configured: local disk on
+        # Fargate is ephemeral, so writing there in production would just
+        # be discarded when the task stops.
+        if s3_client is not None:
+            upload_article_md(s3_client, s3_settings.bucket, s3_settings.prefix, run_timestamp, **kwargs)
+        else:
+            write_article_md(output_dir=output_dir, **kwargs)
+
     async def _fetch_one(article) -> bool:
         nonlocal fetched, failed
         async with semaphore:
@@ -54,21 +84,20 @@ async def fetch_articles(
                     # logged-out crawlers, so there is nothing to crawl here
                     # — the full post text was already captured at collect
                     # time (Article.action_description). Just archive it in
-                    # the same outputs/raw/<source_id>/*.md shape as every
-                    # other source, at zero network cost.
-                    write_article_md(
-                        output_dir=output_dir,
-                        source_id=article["source_id"] or "unknown",
+                    # the same shape as every other source, at zero network
+                    # cost.
+                    _save_article_md(
+                        source_id=article.get("source_id") or "unknown",
                         article_hash=article["article_hash"],
                         title=article["title"],
                         url=article["link"],
-                        markdown=article["action_description"] or article["title"],
-                        category=article["category"] or "auto",
-                        tag=article["competitor_tag"] or "",
-                        product_line=article["product_line"] or "Geral",
-                        event_type=article["event_type"] or "",
-                        alert_level=article["alert_level"] or "",
-                        date=article["published_at"] or "",
+                        markdown=article.get("action_description") or article["title"],
+                        category=article.get("category") or "auto",
+                        tag=article.get("competitor_tag") or "",
+                        product_line=article.get("product_line") or "Geral",
+                        event_type=article.get("event_type") or "",
+                        alert_level=article.get("alert_level") or "",
+                        date=article.get("published_at") or "",
                         image_url=article.get("image_url") or "",
                     )
                     fetched += 1
@@ -130,19 +159,18 @@ async def fetch_articles(
 
                 title = result.metadata.get("title", article["title"]) if result.metadata else article["title"]
 
-                write_article_md(
-                    output_dir=output_dir,
-                    source_id=article["source_id"] or "unknown",
+                _save_article_md(
+                    source_id=article.get("source_id") or "unknown",
                     article_hash=article_hash,
                     title=title,
                     url=target_url,
                     markdown=markdown,
-                    category=article["category"] or "auto",
-                    tag=article["competitor_tag"] or "",
-                    product_line=article["product_line"] or "Geral",
-                    event_type=article["event_type"] or "",
-                    alert_level=article["alert_level"] or "",
-                    date=article["published_at"] or "",
+                    category=article.get("category") or "auto",
+                    tag=article.get("competitor_tag") or "",
+                    product_line=article.get("product_line") or "Geral",
+                    event_type=article.get("event_type") or "",
+                    alert_level=article.get("alert_level") or "",
+                    date=article.get("published_at") or "",
                     image_url=image_url,
                 )
 

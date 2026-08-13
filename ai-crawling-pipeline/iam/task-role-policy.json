@@ -15,6 +15,12 @@
         "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/radar-articles",
         "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/radar-articles/index/*"
       ]
+    },
+    {
+      "Sid": "RadarFetchArchiveBucket",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::<FETCH_BUCKET_NAME>/*"
     }
   ]
 }
