@@ -1,0 +1,30 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RunRadarScraperTask",
+      "Effect": "Allow",
+      "Action": "ecs:RunTask",
+      "Resource": "arn:aws:ecs:<REGION>:<ACCOUNT_ID>:task-definition/radar-scraper:*",
+      "Condition": {
+        "ArnLike": {
+          "ecs:cluster": "arn:aws:ecs:<REGION>:<ACCOUNT_ID>:cluster/radar-scraper"
+        }
+      }
+    },
+    {
+      "Sid": "PassRadarScraperTaskRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::<ACCOUNT_ID>:role/radar-scraper-execution-role",
+        "arn:aws:iam::<ACCOUNT_ID>:role/radar-scraper-task-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

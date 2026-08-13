@@ -355,5 +355,160 @@ Confirm: `aws ecs describe-task-definition --task-definition radar-scraper --reg
 
 ---
 
-*(Later phases — scheduling, verification, read API, frontend — will each add their
-own section here as they're built.)*
+## Phase 4 — Scheduling
+
+An EventBridge Scheduler schedule fires every 3 hours and calls ECS `RunTask` with
+the Phase 3 task definition. Two things need to exist first: a security group giving
+the task outbound internet access (the scraper reaches external RSS feeds, Google
+News, LinkedIn, and the summarize LLM endpoint — none of that is optional), and an
+IAM role letting EventBridge Scheduler actually call `RunTask` on your behalf.
+
+### 1. Networking — subnets and security group
+
+Fargate tasks in `awsvpc` mode need explicit subnets and a security group at
+`RunTask` time; there's no default. The simplest correct setup for this workload —
+no inbound traffic ever, only outbound — is **public subnets with an
+auto-assigned public IP**, which needs no NAT Gateway (that's a real cost saver: a
+NAT Gateway runs ~$32/month plus data processing charges, for a task that only needs
+to *initiate* outbound connections, never receive inbound ones). Private subnets +
+NAT is the more locked-down alternative if your org requires it — same target
+config below, just point `subnets` at private subnets that have a NAT Gateway route.
+
+**Console** — create the security group:
+
+1. VPC → **Security groups** → **Create security group**.
+2. **Name**: `radar-scraper-sg`. **VPC**: your default VPC (or whichever VPC you're
+   deploying into).
+3. **Inbound rules**: none — leave empty. The task never listens for connections.
+4. **Outbound rules**: the default outbound-all-traffic rule that new security
+   groups start with is fine here (`0.0.0.0/0`, all traffic) — RSS feeds, Google
+   News, LinkedIn, DynamoDB, ECR, CloudWatch, SSM, and whatever endpoint
+   `summarize.llm.base_url` points at are all reached over HTTPS, but feed URLs are
+   occasionally plain HTTP, so restricting to 443 alone can silently break a source.
+   If you want it tighter than "all traffic," allow **443/tcp** and **80/tcp** to
+   `0.0.0.0/0` specifically and watch `--validate-feeds` / CloudWatch logs for
+   anything that still fails to connect.
+5. **Create security group**. Note the security group ID (`sg-...`).
+
+**Find your subnet IDs**: VPC → **Subnets** → filter by your VPC → note two subnet
+IDs in different Availability Zones that have **Auto-assign public IPv4 address**
+enabled (public subnets in the default VPC have this on already). If none do, edit
+one: select it → **Actions** → **Edit subnet settings** → enable auto-assign public
+IPv4.
+
+**Confirm it worked**: `aws ec2 describe-security-groups --group-ids <sg-id>
+--query 'SecurityGroups[0].{Inbound:IpPermissions,Outbound:IpPermissionsEgress}'`
+shows an empty inbound list and a non-empty outbound list.
+
+### 2. IAM role for EventBridge Scheduler
+
+`iam/eventbridge-scheduler-policy.json` grants exactly `ecs:RunTask` (scoped to the
+`radar-scraper` task definition and cluster only) and `iam:PassRole` for the two
+Phase 3 task roles (scoped further with an `iam:PassedToService` condition, so this
+role can't be used to pass those roles to anything other than ECS tasks).
+
+Fill in the placeholders the same way as Phase 3:
+
+```bash
+cd ai-crawling-pipeline
+sed -i "s/<ACCOUNT_ID>/<your-account-id>/g; s/<REGION>/<your-region>/g" \
+  iam/eventbridge-scheduler-policy.json
+```
+
+**Console**:
+
+1. IAM → **Policies** → **Create policy** → **JSON** tab → paste
+   `iam/eventbridge-scheduler-policy.json` → name it
+   `radar-scraper-scheduler-policy` → **Create policy**.
+2. IAM → **Roles** → **Create role** → **Trusted entity type**: Custom trust policy
+   → paste:
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [{
+       "Effect": "Allow",
+       "Principal": { "Service": "scheduler.amazonaws.com" },
+       "Action": "sts:AssumeRole"
+     }]
+   }
+   ```
+3. **Permissions**: attach `radar-scraper-scheduler-policy`.
+4. **Role name**: `radar-scraper-scheduler-role`. **Create role**.
+
+**Shortcut**: EventBridge Scheduler's console can auto-create a correctly-scoped role
+for you at the point where you attach the ECS target in step 3 below ("Create new
+role for this schedule"). That's the faster path if you're only ever going to have
+this one schedule; creating the role up front as above is better if you want the
+role's permissions in version control (this repo) rather than console-generated and
+undocumented.
+
+**Confirm it worked**: IAM → Roles → `radar-scraper-scheduler-role` shows **Trusted
+entities: scheduler.amazonaws.com** and the attached policy.
+
+### 3. Create the schedule
+
+**Console**: EventBridge → **Scheduler** → **Create schedule**.
+
+1. **Schedule name**: `radar-scraper-every-3-hours`.
+2. **Schedule pattern**: **Recurring schedule**. Either works — pick one:
+   - **Rate-based**: `rate(3 hours)` — simplest, fires every 3 hours from whenever
+     the schedule was created/enabled.
+   - **Cron-based**: `cron(0 */3 * * ? *)` — fires at fixed wall-clock hours
+     (00:00, 03:00, 06:00, ... UTC). Slightly more predictable for correlating with
+     CloudWatch log timestamps (also UTC) and matches `collect.hours_back: 3`'s
+     assumption of clean, non-overlapping windows.
+3. **Flexible time window**: **Off** — for a single schedule there's no thundering
+   herd to spread out, and predictable timing makes the `hours_back` window easier
+   to reason about.
+4. **Target**: **Templated targets** → **ECS Task**.
+   - **Cluster**: `radar-scraper`.
+   - **Task definition**: `radar-scraper` (latest revision).
+   - **Launch type**: **FARGATE**. **Platform version**: `LATEST`.
+   - **Task count**: `1`.
+   - **Subnets**: the two public subnet IDs from step 1.
+   - **Security group**: `radar-scraper-sg`.
+   - **Auto-assign public IP**: **Enabled** (required for outbound internet access
+     from a public subnet with no NAT Gateway).
+5. **Permissions**: choose the existing role `radar-scraper-scheduler-role` (or let
+   the console create one, per the shortcut above).
+6. **Create schedule**.
+
+**Confirm it worked**: EventBridge → Scheduler → `radar-scraper-every-3-hours` shows
+**State: Enabled** and **Next invocation** populated a few hours out. Phase 5 covers
+actually triggering one manually and checking the result end to end.
+
+**CLI equivalent** (cron version; swap the `ScheduleExpression` for the rate form if
+preferred):
+
+```bash
+aws scheduler create-schedule \
+  --name radar-scraper-every-3-hours \
+  --schedule-expression "cron(0 */3 * * ? *)" \
+  --flexible-time-window '{"Mode": "OFF"}' \
+  --target '{
+    "Arn": "arn:aws:ecs:<REGION>:<ACCOUNT_ID>:cluster/radar-scraper",
+    "RoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/radar-scraper-scheduler-role",
+    "EcsParameters": {
+      "TaskDefinitionArn": "arn:aws:ecs:<REGION>:<ACCOUNT_ID>:task-definition/radar-scraper",
+      "LaunchType": "FARGATE",
+      "PlatformVersion": "LATEST",
+      "TaskCount": 1,
+      "NetworkConfiguration": {
+        "awsvpcConfiguration": {
+          "Subnets": ["<subnet-id-1>", "<subnet-id-2>"],
+          "SecurityGroups": ["<sg-id>"],
+          "AssignPublicIp": "ENABLED"
+        }
+      }
+    }
+  }' \
+  --region <REGION>
+```
+
+Confirm: `aws scheduler get-schedule --name radar-scraper-every-3-hours --region
+<REGION> --query '{State:State,Next:ScheduleExpression}'`.
+
+---
+
+*(Later phases — verification, read API, frontend — will each add their own section
+here as they're built.)*
