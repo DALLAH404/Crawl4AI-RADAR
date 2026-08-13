@@ -470,6 +470,21 @@ pending set, regardless of how large the table has grown. `radar-pipeline
 article that fails for a persistent reason (bad content, not a transient API
 hiccup) would otherwise retry forever on every scheduled run.
 
+**Migration note**: `gsi4pk` used to be a constant `"PENDING"` string before this
+feature existed; changing it to `"STATUS#<status>"` is safe for every write from that
+point on (`db._base_item` recomputes it fresh every time), but does nothing for
+articles already sitting in the table from before the change — their
+`summary_status` is still correctly `pending`, but their stored `gsi4pk` is stuck on
+the old literal `"PENDING"`, which nothing queries for anymore, so they became
+permanently invisible to `pending_articles()`. This bit a real deployment once (a
+first batch of articles collected before this feature was ever pushed). Fixed with
+`scripts/migrate_gsi4_status_scheme.py` — a one-time `Scan` (bypassing the stale
+index, which is the whole problem with querying it here) for base items whose
+`summary_status` is `pending`/`failed`, rewriting each one whose `gsi4pk` doesn't
+match the current scheme. Safe to run more than once; a no-op for anything already
+current. Nothing to run if the table has never seen a version of the pipeline older
+than this feature.
+
 ### Multi-company reads
 
 DynamoDB Query takes one partition-key value at a time, so filtering the frontend's
