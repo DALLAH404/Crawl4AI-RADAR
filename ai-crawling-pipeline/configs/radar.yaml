@@ -5,8 +5,10 @@
 # Default:  collect → fetch → dedup → summarize
 
 db:
-  path: outputs/radar/radar.db
-  embedding_dim: 768
+  table_name: radar-articles
+  # region_name: us-east-1     # defaults to the AWS SDK's usual resolution
+  # endpoint_url: http://localhost:8000   # dynamodb-local / moto only — leave
+                                           # unset in production
 
 collect:
   concurrency: 8
@@ -14,6 +16,14 @@ collect:
   backfill_max_items: 100
   days_back: 30
   backfill_days: 90
+  # Cutoff for a normal-mode --collect run. Set for the every-3-hours
+  # schedule (Phase 4) so each run only looks back as far as the last one;
+  # leave unset to fall back to days_back. --backfill ignores this and uses
+  # backfill_days instead, for a manual wide-range catch-up run.
+  hours_back: 3
+  # Which sources' `tag` to poll this run. Empty = every active source.
+  # Override per-run with `--companies bosch,valeo` without editing the file.
+  companies: []
   # Politeness / resilience knobs for outbound HTTP (see
   # radar_pipeline/sources/ratelimit.py). Tuned to keep news.google.com
   # happy — going harder than this re-triggers the "Sorry..." block.
@@ -122,4 +132,3 @@ summarize:
 
 sources:
   yaml_path: configs/radar_sources.yaml
-  auto_seed: true
