@@ -1,0 +1,44 @@
+{
+  "family": "radar-scraper",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX",
+    "cpuArchitecture": "X86_64"
+  },
+  "cpu": "2048",
+  "memory": "8192",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/radar-scraper-execution-role",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/radar-scraper-task-role",
+  "containerDefinitions": [
+    {
+      "name": "radar-scraper",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/radar-scraper:latest",
+      "essential": true,
+      "environment": [
+        {
+          "name": "AWS_DEFAULT_REGION",
+          "value": "<REGION>"
+        },
+        {
+          "name": "RADAR_TABLE_NAME",
+          "value": "radar-articles"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "OPENAI_API_KEY",
+          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/radar-scraper/openai-api-key"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/radar-scraper",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "radar-scraper"
+        }
+      }
+    }
+  ]
+}

@@ -25,8 +25,11 @@ fi
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}"
 
-echo "== Building ${REPO_NAME}:${IMAGE_TAG} =="
-docker build -t "${REPO_NAME}:${IMAGE_TAG}" "$(dirname "$0")"
+echo "== Building ${REPO_NAME}:${IMAGE_TAG} (linux/amd64) =="
+# Pinned explicitly: task-definition.json's runtimePlatform is X86_64, and
+# "your own machine" might be Apple Silicon — without --platform, a native
+# arm64 build there would push an image Fargate's X86_64 tasks can't run.
+docker build --platform linux/amd64 -t "${REPO_NAME}:${IMAGE_TAG}" "$(dirname "$0")"
 
 echo "== Authenticating Docker to ECR (${AWS_REGION}) =="
 aws ecr get-login-password --region "${AWS_REGION}" \
