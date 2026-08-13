@@ -3,7 +3,7 @@
 # somewhere with AWS credentials (CloudShell, your own machine) — not from
 # the Codespace this was written in, which has no AWS access.
 #
-# Prerequisite: the `news-scraper` ECR repo already exists (DEPLOYMENT.md,
+# Prerequisite: the `radar-scraper` ECR repo already exists (DEPLOYMENT.md,
 # Phase 2 — "Create the ECR repo" console steps).
 #
 # Usage:
@@ -15,7 +15,7 @@ set -euo pipefail
 
 AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-<your-account-id>}"
 AWS_REGION="${AWS_REGION:-<your-region>}"
-REPO_NAME="${REPO_NAME:-news-scraper}"
+REPO_NAME="${REPO_NAME:-radar-scraper}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 
 if [[ "$AWS_ACCOUNT_ID" == "<your-account-id>" || "$AWS_REGION" == "<your-region>" ]]; then

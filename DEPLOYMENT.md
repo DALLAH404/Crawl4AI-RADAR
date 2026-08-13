@@ -163,20 +163,20 @@ AWS_SESSION_TOKEN=...` from `aws configure export-credentials` or similar) and a
 
 **Console**: ECR → **Repositories** → **Create repository**.
 - **Visibility**: Private.
-- **Repository name**: `news-scraper`.
+- **Repository name**: `radar-scraper`.
 - Leave **Tag immutability** and **Scan on push** at their defaults (or turn on
   **Scan on push** if you want vulnerability scanning on every push — optional, no
   cost impact on the pipeline itself).
 - Everything else default. **Create repository**.
 
-**Confirm it worked**: the repository list shows `news-scraper`; `aws ecr
-describe-repositories --repository-names news-scraper --region <your-region>` returns
+**Confirm it worked**: the repository list shows `radar-scraper`; `aws ecr
+describe-repositories --repository-names radar-scraper --region <your-region>` returns
 its `repositoryUri`.
 
 **CLI equivalent**:
 
 ```bash
-aws ecr create-repository --repository-name news-scraper --region <your-region>
+aws ecr create-repository --repository-name radar-scraper --region <your-region>
 ```
 
 ### Push the image
@@ -191,8 +191,8 @@ AWS_ACCOUNT_ID=<your-account-id> AWS_REGION=<your-region> ./push_to_ecr.sh
 ```
 
 **Confirm it worked**: the script prints the pushed image URI at the end
-(`<account>.dkr.ecr.<region>.amazonaws.com/news-scraper:latest`); `aws ecr
-list-images --repository-name news-scraper --region <your-region>` should list a
+(`<account>.dkr.ecr.<region>.amazonaws.com/radar-scraper:latest`); `aws ecr
+list-images --repository-name radar-scraper --region <your-region>` should list a
 `latest`-tagged image. Keep the printed URI — Phase 3's task definition needs it.
 
 ---
