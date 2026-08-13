@@ -1,15 +1,18 @@
 # Radar Pipeline
 
-Local-first news-aggregation pipeline for the Brazilian automotive aftermarket. Drives a
-single SQLite database through four stages — **collect → fetch → dedup → summarize** —
-persisting structured intelligence (summaries, event types, alert levels) per article.
+News-aggregation pipeline for the Brazilian automotive aftermarket. Drives a DynamoDB
+table through four stages — **collect → fetch → dedup → summarize** — persisting
+structured intelligence (summaries, event types, alert levels) per article. Runs as a
+scheduled ECS Fargate task; storage moved from a local SQLite file to DynamoDB so the
+pipeline has no local disk state to lose between runs (see [Database layer](#database-layer--dbpy)).
 
 ```
 configs/radar.yaml  ──┐
                       ▼
    ┌──── radar-pipeline (cli.py) ────────────────────────────────┐
    │                                                             │
-   │  sources/catalog.py ──► seed 100+ sources from YAML         │
+   │  sources/catalog.py ──► load 100+ sources straight from YAML│
+   │                          (no DB — see Sources below)        │
    │                                                             │
    │  collect  sources/collector.py        RSS / Google News /   │
    │     │                                 LinkedIn companies    │
@@ -36,19 +39,28 @@ configs/radar.yaml  ──┐
    └─────────────────────────────────────────────────────────────┘
                      │
                      ▼
-        outputs/radar/{radar.db, raw/, processed/}
+   DynamoDB table (db.table_name)  +  outputs/radar/{raw/, processed/}
 ```
 
 ## Pipeline stages
 
 ### 1. Collect — `sources/collector.py:collect_once`
 
-Reads active sources from the `sources` table and concurrently polls RSS feeds,
-Google News queries, and LinkedIn company pages. Key behaviours:
+Takes the list of active sources loaded fresh from `configs/radar_sources.yaml`
+(`sources/catalog.py:list_sources`, `active_only=True` — see [Sources](#sources) below)
+and concurrently polls RSS feeds, Google News queries, and LinkedIn company pages. Key
+behaviours:
 
+- **Config-driven company + date-range scope** — `collect.companies` (a list of
+  source `tag` values) restricts a run to those companies only; empty means every
+  active source. `collect.hours_back` sets a fine-grained normal-mode cutoff (e.g. `3`
+  for the every-3-hours schedule) instead of the coarser `days_back`; `--backfill`
+  switches to `backfill_days` for a manual wide-range catch-up run. All three are
+  overridable per-run via `--companies`, `--hours-back`, `--backfill` without editing
+  the YAML.
 - **Source types** — `rss_direct` (uses `rss_url` verbatim), `google_news_query`
-  (builds a Google News RSS URL from `query_text`, optionally with a `when:Nd` date
-  filter), and `linkedin_company` (scrapes the logged-out LinkedIn "About" page for
+  (builds a Google News RSS URL from `query_text`, optionally with a `when:Nd`/`when:Nh`
+  date filter), and `linkedin_company` (scrapes the logged-out LinkedIn "About" page for
   `query_text`, treated as a company slug — see [LinkedIn sources](#linkedin-sources)
   below).
 - **Two collection passes** — RSS/Google-News sources are gathered together, bounded
@@ -69,9 +81,11 @@ Google News queries, and LinkedIn company pages. Key behaviours:
   `article_hash = md5(resolved_link)` is stable across re-runs and feeds. LinkedIn
   post URLs are already canonical and are used as-is — the resolver is never called
   for `linkedin_company` sources.
-- **Deduplicate at insert** — `find_by_article_hash(con, article_hash, exclude_id=...)`
-  is checked; if a different row already has the same hash, the item is skipped
-  (no DB write).
+- **Deduplicate at insert** — `find_by_article_hash(store, article_hash)` is checked
+  first; then `put_article(store, article)` is itself a conditional write
+  (`attribute_not_exists(pk)`) keyed on `article_hash`, so even a race between two
+  concurrent collect passes can't create two items for the same hash — the loser's
+  write is silently rejected rather than skipped by a pre-check that could race.
 - **Keyword classify** — `classify_article(title, summary)` assigns
   `event_type / alert_level / is_launch` synchronously, with no LLM call. Values
   are stored at insert time and re-derivable later via `--classify`.
@@ -141,10 +155,12 @@ only the DB integration is new here.
 Crawls the pending articles' resolved URLs with **Crawl4AI** and writes the page
 content as Markdown to `outputs/radar/raw/<source_id>/<source_id>_<hash8>.md`.
 
-- **Pending source** — `pending_articles(con)` returns rows where
-  `summary_status = 'pending' AND category IN ('auto','economia') AND
-  (dedup_decision IS NULL OR dedup_decision != 'duplicate')`, left-joined against
-  `sources` for `feed_type` (needed to route LinkedIn rows below). (See
+- **Pending source** — `pending_articles(store)` queries the `PendingIndex` GSI
+  (sparse: only items with `summary_status = 'pending'`) and filters to
+  `category IN ('auto','economia') AND (dedup_decision NOT EXISTS OR dedup_decision
+  != 'duplicate')`. `feed_type` (needed to route LinkedIn rows below) is denormalized
+  onto the article itself at collect time — see [Sources](#sources) — rather than
+  joined from a sources table, since DynamoDB has no join. (See
   [Dedup below](#3-dedup--deduplayerspy) for why duplicates are excluded.)
 - **LinkedIn short-circuit** — `linkedin_company` rows skip Crawl4AI entirely and
   the og:image fetch below. LinkedIn authwalls individual `/posts/` URLs for
@@ -163,8 +179,8 @@ content as Markdown to `outputs/radar/raw/<source_id>/<source_id>_<hash8>.md`.
   signature, so a fresh resolution is more reliable than reusing the value from
   collect).
 - **Cross-article duplicate URL check** — re-computes `md5(target_url)` and
-  queries `find_by_article_hash`. If a *different* article (`existing["id"] !=
-  article["id"]`) already points to the same canonical URL, the crawl is
+  queries `find_by_article_hash`. If a *different* article (`existing["article_hash"]
+  != article["article_hash"]`) already points to the same canonical URL, the crawl is
   skipped (no markdown written, no failed counter incremented).
 - **Image enrichment** — uses `image_url` from the feed if non-empty; otherwise
   fetches the page with `httpx` and parses `og:image` via
@@ -180,7 +196,7 @@ content as Markdown to `outputs/radar/raw/<source_id>/<source_id>_<hash8>.md`.
 - **Failure handling** — any exception in `_fetch_one` is caught and counted as
   `failed`; the pipeline does not abort on per-article failures. Empty markdown
   also counts as `failed`. The article's `image_url` is persisted via
-  `UPDATE articles SET image_url = ? WHERE id = ?` (only on success).
+  `update_article(store, article_hash, image_url=...)` (only on success).
 
 ### 3. Dedup — `dedup/layers.py`
 
@@ -189,27 +205,31 @@ implementation keeps only **two layers**:
 
 | Layer | Mechanism                              | Match scope                       | Reason         |
 |-------|----------------------------------------|-----------------------------------|----------------|
-| 0     | `article_hash` (= `md5(resolved_link)`) | entire `articles` table            | `same_url`     |
-| 1     | `title_hash` (= `md5(normalize_title)`)  | published within `title_window_hours` | `same_title`   |
+| 0     | `article_hash` (= `md5(resolved_link)`) | whole table, via `find_by_article_hash` | `same_url`     |
+| 1     | `title_hash` (= `md5(normalize_title)`)  | published within `title_window_hours`, via the `DedupIndex` GSI | `same_title`   |
 
-Each layer excludes the article itself via `exclude_id=article["id"]`
-(see [Corner cases — self-match](#self-match-bug--exclude_id)) so an article
-never deduplicates against its own row.
+Layer 0 is a structural no-op — `article_hash` is the table's own partition key, so
+a lookup by an article's own hash can never return anything but itself, exclusion or
+not. It's kept for behavioral parity with the pre-DynamoDB version rather than
+special-cased away (see [Corner cases](#corner-cases--known-limitations)); the write
+path (`put_article`'s conditional `attribute_not_exists(pk)`) is what actually
+prevents a same-URL duplicate from ever reaching the table in the first place. Layer
+1's `exclude_hash=article_hash` does matter, since a title-hash match is a *different*
+item.
 
 `classify_article` returns a `DedupResult` with `decision ∈ {duplicate, new}`,
-the matching `layer`, `reason`, `match_id` of the older duplicate, and optional
+the matching `layer`, `reason`, `match_hash` of the older duplicate, and optional
 `score`.
 
-`run_dedup` then writes back:
+`run_dedup` then writes back via `update_article`:
 - If `duplicate` — sets `dedup_decision='duplicate'`, `dedup_layer`,
-  `dedup_reason`, `dedup_match_id`, `dedup_score`.
+  `dedup_reason`, `dedup_match_hash`, `dedup_score`.
 - If `new` — sets `dedup_decision='new'`.
 
-`summary_status` is intentionally **not** modified here (the schema's CHECK
-constraint restricts it to
-`pending / ai_generated / scraped_fallback / irrelevant / failed`). Instead,
-`pending_articles` excludes rows where `dedup_decision='duplicate'`, which is
-how the dedup→summarize handshake works (see [Corner cases — summary_status](#summary_status-constraint--dedup_decision-independence)).
+`summary_status` is intentionally **not** modified here — it stays independent of
+`dedup_decision` (DynamoDB has no CHECK constraint to enforce this, but the
+application code never conflates the two). Instead, `pending_articles` excludes items
+where `dedup_decision='duplicate'`, which is how the dedup→summarize handshake works.
 
 #### Removed layers (preserved implementation)
 
@@ -234,16 +254,18 @@ Calls an OpenAI-compatible LLM (default `deepseek-v4-flash` via a custom
 `base_url`) for every *new* (non-duplicate) pending article and writes two
 artefacts:
 
-1. **Database update** — `summary`, `competitor_analysis`, `event_type`,
-   `alert_level`, `summary_status='ai_generated'`, `ai_model`, `ai_processed_at`.
+1. **DynamoDB update** — `update_article(store, article_hash, ...)` sets `summary`,
+   `competitor_analysis`, `event_type`, `alert_level`,
+   `summary_status='ai_generated'`, `ai_model`, `ai_processed_at` on the base item
+   (and its company-link items — see [Database layer](#database-layer--dbpy)).
 2. **JSON file** — `summarize/writer.write_summary_json` writes
-   `outputs/radar/processed/<source_id>/<source_id>_<article_id>_<hash8>.json`
+   `outputs/radar/processed/<source_id>/<source_id>_<hash8>.json`
    containing a flat object with article metadata and the title, summary,
    competitor analysis, event_type, and alert_level.
 
 Behaviour:
 
-- **Input** — `pending_articles(con)` (same filter as fetch; dedup duplicates are
+- **Input** — `pending_articles(store)` (same filter as fetch; dedup duplicates are
   excluded by construction).
 - **Content assembled** — `action_description` is the base; if the article has
   a non-empty `summary` (e.g. set by a previous run), it is prepended.
@@ -277,8 +299,9 @@ Behaviour:
 
 | Setting              | Default                          | Notes                                   |
 |----------------------|----------------------------------|-----------------------------------------|
-| `db.path`            | `outputs/radar/radar.db`        | SQLite + sqlite-vec (WAL)               |
-| `fetch.output_dir`   | `outputs/radar/raw`             | Crawl4AI markdown output                |
+| `db.table_name`      | `radar-articles`                 | DynamoDB table (see below)              |
+| `db.endpoint_url`    | unset                            | Local/dev only — dynamodb-local or moto; unset means real AWS |
+| `fetch.output_dir`   | `outputs/radar/raw`              | Crawl4AI markdown output                |
 | `summarize.output_dir` | `outputs/radar/processed`       | LLM-summarized JSON output              |
 | `sources.yaml_path`  | `configs/radar_sources.yaml`    | Source catalog (100+ seeds, incl. 13 LinkedIn) |
 
@@ -300,13 +323,31 @@ Output paths were deliberately moved from the shared `outputs/` tree to
 | `--summarize`       | Summarize pending (non-duplicate) articles.                  |
 | `--status`          | Print source and article statistics (read-only).             |
 | `--validate-feeds`  | Probe every active source URL without inserting any rows. LinkedIn sources are printed `[SKIP]` — httpx probing is meaningless against a browser-rendered page; use `--collect` to actually validate them. |
+| `--backfill`        | Scope `--collect` to `collect.backfill_days` (wide manual catch-up) instead of the normal schedule window. |
+| `--companies TAGS`  | Comma-separated source `tag`s to scope `--collect` to this run, overriding `collect.companies`. |
+| `--hours-back N`    | Override `collect.hours_back` for this run (normal mode only). |
 
-Sub-commands: `sources-list [--active-only]`, `sources-import-yaml`,
-`sources-enable <id>`, `sources-disable <id>`.
+Sub-command: `sources-list [--active-only]` — reads straight from the YAML catalog.
+There's no `sources-enable`/`sources-disable`/`sources-import-yaml` anymore: since
+sources aren't stored in a database (see [Sources](#sources) below), there's nothing
+left to seed or toggle at runtime — edit `active:` in `configs/radar_sources.yaml`
+directly.
 
 If **no stage flag is passed**, the default sequence runs:
 `collect → fetch → dedup → summarize`. `--status` only prints stats and never
 mutates data.
+
+### Sources
+
+Sources (RSS feeds, Google News queries, LinkedIn company slugs) live entirely in
+`configs/radar_sources.yaml` — there is no DynamoDB table for them.
+`sources/catalog.py:list_sources` parses the YAML fresh on every run; `active_only=True`
+filters to `active: true`. This is a deliberate simplification from the SQLite version,
+which seeded the YAML into a `sources` table and offered `sources-enable`/`sources-disable`
+to flip `active` at runtime — that mutable state added a table and a migration
+(`migration_0002`, widening the `feed_type` CHECK) for data that's small, static, and
+hand-edited anyway. Toggling a source now means editing the YAML; there was nothing else
+in that table worth keeping a database for.
 
 ### Environment variables
 
@@ -321,74 +362,67 @@ Crawl4AI-based fetch in this pipeline.
 
 ## Database layer — `db.py`
 
-SQLite is opened via `pysqlite3` (the system `sqlite3` lacks the
-`sqlite-vec` extension). `connect()`:
+A single DynamoDB table (`db.table_name`, default `radar-articles`) accessed via
+boto3's resource API. `connect()` returns a `RadarStore` wrapping the `Table`
+resource; `ensure_table()` creates the table and its 4 GSIs if missing — **local/dev
+use only** (moto in tests, optionally `dynamodb-local`). The production table is
+created once via the console/CLI steps in `DEPLOYMENT.md`, not by the app on every
+boot, so the task's IAM role can stay read/write-only (no `CreateTable`).
 
-1. Creates the parent directory of `db.path` if missing.
-2. Loads `sqlite_vec` for the `vec0` virtual table.
-3. Sets `row_factory = sqlite3.Row`.
-4. Enables WAL mode and foreign keys.
+Identity is `article_hash` (`md5` of the resolved article URL) everywhere — there is
+no auto-increment ID. DynamoDB has no ROWID equivalent, and keying writes off a value
+derived from the article itself is what makes `put_article` idempotent: a re-scraped
+article overwrites the same item instead of creating a duplicate. This replaced every
+`article["id"]` reference across the fetch, dedup, summarize, and CLI stages with
+`article["article_hash"]`.
 
-### Schema (created by `init_schema`)
+### Schema — item types and GSIs
 
-- **`sources`** — catalog with CHECK constraints on `source_type`,
-  `category ∈ {auto, economia, tecnologia}`, `feed_type ∈ {rss_direct,
-  google_news_query, linkedin_company}` (widened from just the first two by
-  `migrations/migration_0002.py` — SQLite can't `ALTER` a CHECK, so it's a
-  table rebuild; see [Migrations](#migrations--migrations) below). For
-  `linkedin_company` sources, `query_text` holds the LinkedIn company slug
-  instead of a search query.
-- **`articles`** — core table. Note the CHECK constraints:
-  - `summary_status ∈ {pending, ai_generated, scraped_fallback, irrelevant,
-    failed}` (no `'duplicate'` value — see "summary_status" corner case below).
-  - `alert_level ∈ {Alto, Medio, Baixo, ''}`.
-  - `dedup_decision ∈ {new, duplicate, ''}`.
-  - `is_launch` and `active` are stored as INTEGER 0/1.
-  - UNIQUE on `article_hash` and `link`.
-- **`collection_runs`** — per-source audit of each collect invocation.
-- **`vec_articles`** — `vec0` virtual table keyed by `articles.id` with a
-  `float[768]` embedding column using cosine distance. Populated only when
-  Layer 3 was active; currently unused.
-- **`articles_fts`** — FTS5 over `title, summary, action_description` with
-  `content='articles'` (external-content table) and triggers `articles_ai` /
-  `articles_ad` (and an `articles_au` update trigger created by
-  `_ensure_fts_triggers`). Syncs FTS on insert and delete but not on update.
-- **Views** — `vw_source_health_daily`, `vw_stale_sources` for quick observability.
+One table, three item types, sharing four GSIs (all `ProjectionType: ALL` — item
+sizes here are small, so the extra storage cost buys skipping an N+1 `GetItem` on
+every read):
 
-### Returned row shapes — corner case
+| Item | Key | GSI entry | Purpose |
+|---|---|---|---|
+| **Base article** | `pk=ARTICLE#<hash>` `sk=METADATA` | `LatestIndex`: `gsi2pk=ARTICLE, gsi2sk=<ts>#<hash>` | Every article field; "latest N overall" |
+| | | `DedupIndex`: `gsi3pk=TITLEHASH#<title_hash>, gsi3sk=<ts>#<hash>` | Layer 1 title-hash dedup within a window |
+| | | `PendingIndex`: `gsi4pk=PENDING, gsi4sk=<ts>#<hash>` (only while `summary_status='pending'`) | `pending_articles()` without scanning the whole table |
+| **Raw-link pointer** | `pk=ARTICLE#<hash>` `sk=RAWLINK#<rawhash>` | `DedupIndex`: `gsi3pk=RAWLINK#<rawhash>, gsi3sk=METADATA` | `find_by_raw_link` — the fast pre-resolve dedup check |
+| **Company link** | `pk=ARTICLE#<hash>` `sk=COMPANY#<tag>` | `CompanyTimeIndex`: `gsi1pk=COMPANY#<tag>, gsi1sk=<ts>#<hash>` | Per-company timeline (denormalized display fields, one item per company an article is relevant to) |
 
-Several functions in `db.py` return `list[dict[str, Any]]` rather than
-`list[sqlite3.Row]`:
+`Article.companies()` derives the company list from `competitor_tag` (comma-separated
+if a source should fan an article out to more than one company — today every source
+carries exactly one tag, so this is normally a single-element list). One article
+produces one base item + one raw-link pointer + N company-link items, written as
+separate `put_item` calls rather than a `TransactWriteItems` — see the comment on
+`_write_article` for why that tradeoff was made at this project's scale.
 
-- `get_active_sources`, `get_all_sources` — used by the collector and CLI; the
-  collector calls `.get("category", ...)` on each row, which `sqlite3.Row`
-  doesn't support.
-- `pending_articles` — used by both fetch and summarize; the fetch stage does
-  `article.get("image_url")` on each row.
+The old SQLite `sources` and `collection_runs` tables have no DynamoDB equivalent —
+sources moved to pure YAML config (see [Sources](#sources)), and per-run audit history
+isn't persisted at all (CloudWatch Logs from the Fargate task covers it; see
+`_reduce_results` in `collector.py`). `vec_articles` (sqlite-vec KNN) and `articles_fts`
+(FTS5) were dropped too: both were already unused dead weight (Layers 2–4 were removed
+from dedup before this migration — see [Removed layers](#removed-layers-preserved-implementation)),
+and DynamoDB has no equivalent of either (would need OpenSearch to bring them back,
+which is out of scope here).
 
-These functions wrap each row with `dict(r)`. Callers that index rows (e.g.
-`find_by_article_hash` returning `sqlite3.Row | None`) are unchanged — Row
-supports `row["col"]` but not `.get`.
+### Multi-company reads
 
-### Migrations — `migrations/`
+DynamoDB Query takes one partition-key value at a time, so filtering the frontend's
+feed by more than one company (`articles_for_companies`) fans out into one
+`CompanyTimeIndex` Query per company and merges the results in Python by
+`published_at`, deduping on `article_hash` in case an article is linked to more than
+one of the selected companies. The single-company case (`articles_for_company`) is
+just one Query.
 
-`run_migrations(con)` in `db.py` records the schema version in
-`schema_version`. `apply_migration(con, version)` imports
-`radar_pipeline.migrations.migration_NNNN` dynamically. New migrations should
-follow the same `apply(con) -> None` convention and increment `SCHEMA_VERSION`
-in `db.py`.
+### Irrelevant articles are invisible to dedup lookups
 
-- `migration_0001` — initial schema (delegates to `init_schema`).
-- `migration_0002` — widens `sources.feed_type`'s CHECK constraint to allow
-  `'linkedin_company'`. Rebuilds the table (`sources_new` → copy rows → drop →
-  rename), since SQLite has no `ALTER TABLE ... ALTER CHECK`. Idempotent: a
-  no-op if the table's DDL already mentions `linkedin_company` — which is the
-  case on a fresh DB, since `init_schema` already creates `sources` with the
-  widened CHECK baked in. `init_schema`'s own `schema_version` stamp is
-  therefore guarded to fire only on a genuinely fresh DB (no version row at
-  all); an existing v1 DB is left for `run_migrations` to advance a step at a
-  time, or `migration_0002` would never run (it would see `current == 2`
-  already and skip).
+`find_by_article_hash` and `find_by_title_hash_within` both skip an item whose
+`summary_status == 'irrelevant'` — carried over from the old SQLite
+`AND summary_status != 'irrelevant'` clause on the same lookups. `get_article` (used
+by `update_article`, `--status`, etc.) does **not** filter this — an irrelevant
+article is still a real, readable row; it just doesn't count as "already seen" for
+dedup purposes.
 
 ## Observability — `observability/`
 
@@ -414,63 +448,38 @@ in `db.py`.
 This section documents every previously-broken behaviour and the resolution
 applied, so that the next maintainer does not rediscover them.
 
-### Self-match bug — `exclude_id`
+### Self-match — structurally impossible now, was a bug pre-DynamoDB
 
-**Symptom**: every pending article was reported as `duplicate / layer=0 /
-same_url` with `dedup_match_id == article.id` (an article matched itself).
+**Original symptom (SQLite version)**: every pending article was reported as
+`duplicate / layer=0 / same_url` with `dedup_match_id == article.id` (an article
+matched itself), because `find_by_article_hash` queried the whole table with no
+self-exclusion.
 
-**Cause**: the article is inserted during collect, then dedup runs later and
-queries `find_by_article_hash(con, article_hash)` against the *whole* table —
-including the article's own row. No exclusion was applied.
+**Under DynamoDB**: `article_hash` is the table's own partition key. A lookup by an
+article's own hash cannot return anything but that same item — `find_by_article_hash`
+and `find_by_title_hash_within` both take `exclude_hash`, and Layer 0 in
+`dedup/layers.py` is a documented no-op preserved for parity (see
+[Database layer](#database-layer--dbpy)) rather than special-cased away. The old
+class of bug — a lookup silently including the row you're checking — can't recur here
+because there's no separate row-vs-key identity to forget to exclude.
 
-**Fix**: `exclude_id: int | None = None` was added to `find_by_article_hash`,
-`find_by_title_hash_within`, `candidate_titles_within`, `fts5_search_within`,
-`knn_within`, and threaded through `classify_article(article_id=...)`,
-`run_dedup(article_id=article["id"])`, and `hybrid_search(exclude_id=...)`.
-Existing callers in `collector.py` and `crawl.py` use the default `None` and
-remain unchanged.
+### `summary_status` / `dedup_decision` independence
 
-**Verification**: after the fix, `SELECT COUNT(*) FROM articles WHERE
-dedup_decision='duplicate' AND dedup_match_id = id` returns `0`.
+**Symptom (original)**: an earlier attempt set `summary_status='duplicate'` during
+the dedup update, which crashed against SQLite's CHECK constraint on that column.
 
-### `summary_status` constraint — `dedup_decision` independence
-
-**Symptom**: an earlier attempt set `summary_status='duplicate'` during the
-dedup UPDATE, which crashed with `CHECK constraint failed: summary_status IN
-('pending','ai_generated','scraped_fallback','irrelevant','failed')`.
-
-**Cause**: the schema CHECK constraint enumerates allowed `summary_status`
-values and does not include `'duplicate'`.
-
-**Fix**: dedup never touches `summary_status`. The dedup→summarize handshake
-uses two independent columns:
+**Fix, preserved under DynamoDB**: dedup never touches `summary_status`. The
+dedup→summarize handshake still uses two independent fields:
 
 - `summary_status` (set by collect / summarize).
 - `dedup_decision` (set by dedup).
 
-`pending_articles` filters on both:
-```sql
-WHERE summary_status = 'pending'
-  AND category IN ('auto','economia')
-  AND (dedup_decision IS NULL OR dedup_decision != 'duplicate')
-```
-
-Consequence: an article stays in the pending pool after being marked duplicate
-only if a future code path resets `dedup_decision`. The CLI never does this.
-
-### `INSERT OR REPLACE` on vec0
-
-**Symptom**: `UNIQUE constraint failed on vec_articles primary key` when
-re-running dedup on a DB that already contained vectors.
-
-**Cause**: `sqlite-vec`'s `vec0` virtual table does not support
-`INSERT OR REPLACE`. The OR REPLACE keyword causes SQLite to fall back to a
-DELETE-then-INSERT path that `vec0` does not implement for the primary key.
-
-**Fix**: `insert_vector` does `DELETE FROM vec_articles WHERE rowid = ?` then
-`INSERT INTO vec_articles(rowid, embedding) VALUES (?, ?)`. This is idempotent
-on re-runs. The function itself is currently unused (Layer 3 is disabled); the
-fix is in place so a future re-enable does not regress.
+`pending_articles` filters on both — via the sparse `PendingIndex` GSI (only items
+with `summary_status='pending'` are in it at all) plus a `FilterExpression` for
+`category IN ('auto','economia') AND (dedup_decision NOT EXISTS OR dedup_decision !=
+'duplicate')`. DynamoDB has no CHECK constraint to enforce the separation the way
+SQLite did, so this now relies entirely on the application code never conflating the
+two — worth remembering before adding a third status-like field.
 
 ### `BrowserConfig` duplicate `headless` keyword
 
@@ -485,20 +494,6 @@ that itself contained `headless`.
 browser_kwargs.setdefault("headless", True); BrowserConfig(**browser_kwargs)`.
 The YAML can still override `headless` if it wants; the explicit default only
 fires when the YAML omits the key.
-
-### `pysqlite3.Row` lacks `.get`
-
-**Symptom**: `'pysqlite3.dbapi2.Row' object has no attribute 'get'` during
-collect (`source.get("category", ...)`) and fetch
-(`article.get("image_url")`).
-
-**Cause**: `connect()` sets `row_factory = sqlite3.Row`. Row supports
-`row["col"]` and `row[0]` indexing but not the dict-only `.get` method.
-
-**Fix**: `get_active_sources`, `get_all_sources`, and `pending_articles` return
-`list[dict[str, Any]]` by wrapping each row with `dict(r)`. Other find
-functions (`find_by_article_hash`, `find_by_title_hash_within`) still return
-`sqlite3.Row | None` because their callers only use `row["col"]` indexing.
 
 ### Empty `article_hash`
 
@@ -535,8 +530,13 @@ redundant second embedding for every "new" article inside `run_dedup` for
 texts) but quota pressure remains.
 
 **Fix**: Layer 3 (and Layer 4 judge) are removed from `classify_article`. The
-`GeminiEmbedder` class, `embed_many`, `hybrid_search`, `judge`, and
-`insert_vector` are preserved as dead code for opt-in re-enablement.
+`GeminiEmbedder` class, `embed_many`, `hybrid_search`, and `judge` are preserved as
+dead code for opt-in re-enablement — though re-enabling now means more than flipping
+a flag: `dedup/hybrid.py` and `db.fts5_search_within`/`db.knn_within`/`insert_vector`
+were built against SQLite's `sqlite-vec`/FTS5 extensions, which have no DynamoDB
+equivalent (`db.py` no longer defines them at all — those imports would now fail).
+Reviving Layer 3/4 on DynamoDB would mean standing up something like OpenSearch for
+the vector/full-text search, not just restoring the old function calls.
 
 ### `httpx.sleep` does not exist
 
@@ -608,15 +608,16 @@ Current stage timings on a ~40-article batch (90 sources polled):
 |------------|------------|---------------------------------------------|
 | collect    | ~46s       | 90 RSS polls (many Google News 503s)        |
 | fetch      | ~160s      | Crawl4AI per-article with Playwright        |
-| **dedup**  | **~0.1s**  | Two SQL lookups per article, no API calls   |
+| **dedup**  | **~0.1s**  | Two point lookups per article (GetItem + GSI Query), no API calls |
 | summarize  | ~70s       | One LLM call per relevant article (conc=8)  |
 
-dedup's ~3000× speedup vs. the previous embedding-based implementation is the
-direct result of removing the Gemini `embed_many` round-trip and the
-sequential per-article loop. If Layer 3 is re-enabled, prefer the existing
-`embed_many` batch path (one API call for the whole corpus) over per-article
-`embed` calls, and re-use the returned embedding for `insert_vector` to avoid
-the redundant double-embed seen in the original code.
+These timings predate the DynamoDB migration (they were measured against SQLite) but
+the dedup stage's relative cheapness should carry over or improve — a `GetItem` by
+`article_hash` and a `Query` against the sparse `DedupIndex` GSI are both O(1)-ish
+regardless of table size, unlike a full-table SQL scan would become as the table
+grows across months of 3-hourly runs. If Layer 3 is ever re-enabled (see
+[Removed Layer 3](#removed-layer-3-gemini-embedding--quota--latency)), re-measure
+here — it would need its own storage (OpenSearch or similar), not a DynamoDB GSI.
 
 Future fetch speedups would require either higher concurrency, caching of
 crawl results between runs, or a headless-browser pool rather than the current
@@ -628,17 +629,18 @@ per-article `AsyncWebCrawler` lifecycle in `crawl.py`.
 src/radar_pipeline/
 ├── __init__.py             re-exports `main`
 ├── __main__.py             `python -m radar_pipeline`
-├── cli.py                  argparse + stage orchestration + status/sources subcommands
+├── cli.py                  argparse + stage orchestration + status/sources-list
 ├── config.py               dataclasses + YAML loader (load_radar_config)
 ├── models.py               Source, Article, CollectionRun, DedupResult, SummarizeResult, ...
-├── db.py                   connect(), init_schema(), run_migrations(), find_*,
-│                           pending_articles, insert_article, insert_source, insert_vector,
-│                           mark_article_irrelevant/failed, candidate/fts5/knn helpers
+├── db.py                   DynamoDB layer: connect(), ensure_table() (local/dev),
+│                           put_article, update_article, get_article, find_*,
+│                           pending_articles, latest_articles, articles_for_company(ies),
+│                           mark_article_irrelevant/failed, article_count*
 ├── classify/
 │   ├── rules.py            eh_fora_de_escopo, classify_article (keyword priority chain)
 │   └── keywords.py         FORA_ESCOPO, KW_LANCAMENTO, KW_PECA_AUTOMOTIVA, TEMAS_KW
 ├── sources/
-│   ├── catalog.py          seed_from_yaml, add/set_active/list sources
+│   ├── catalog.py          load_sources/list_sources — parses configs/radar_sources.yaml, no DB
 │   ├── collector.py        collect_once (async, two passes: RSS/GNews + LinkedIn)
 │   ├── feedparser.py       fetch_and_parse (httpx + feedparser)
 │   ├── gnews.py            resolve_google_news_url (batchexecute → redirect → base64)
@@ -651,12 +653,9 @@ src/radar_pipeline/
 ├── dedup/
 │   ├── layers.py           Deduper.classify_article (Layer 0 + 1), run_dedup
 │   ├── embedding.py        GeminiEmbedder (PRESERVED, unused)
-│   ├── hybrid.py           hybrid_search + reciprocal_rank_fusion (PRESERVED, unused)
+│   ├── hybrid.py           hybrid_search + reciprocal_rank_fusion (PRESERVED, unused —
+│   │                       imports from db.py that no longer exist; see Removed Layer 3)
 │   └── judge.py            judge LLM disambiguator (PRESERVED, unused)
-├── migrations/
-│   ├── __init__.py          apply_migration dispatch
-│   ├── migration_0001.py   initial migration
-│   └── migration_0002.py   widen sources.feed_type CHECK for linkedin_company
 ├── summarize/
 │   ├── pipeline.py         run_summarize (LLM concurrency + DB/JSON write)
 │   ├── client.py           summarize_one (AsyncOpenAI + retries + JSON fallback)
@@ -688,8 +687,25 @@ uv run radar-pipeline --classify
 
 # probe source URLs without writing
 uv run radar-pipeline --validate-feeds
+
+# scope a run to specific companies and/or a tighter time window, without
+# editing configs/radar.yaml
+uv run radar-pipeline --collect --companies bosch,valeo --hours-back 3
+
+# wide manual catch-up instead of the normal schedule window
+uv run radar-pipeline --collect --backfill
+```
+
+Point `db.endpoint_url` (in the config, or `--endpoint-url` on
+`scripts/check_dynamodb_idempotency.py`) at `dynamodb-local` for a fully offline dev
+loop:
+
+```bash
+docker run -p 8000:8000 amazon/dynamodb-local
+uv run python scripts/check_dynamodb_idempotency.py --endpoint-url http://localhost:8000
 ```
 
 Tests live in `tests/radar_pipeline/` and run via `uv run pytest
-tests/radar_pipeline/ -q`. The suite covers classify, db, collector (RSS and
-LinkedIn), and the LinkedIn extraction layer (127 tests).
+tests/radar_pipeline/ -q`. The suite covers classify, db (against a moto-mocked
+DynamoDB table — see `conftest.py`), collector (RSS and LinkedIn), and the LinkedIn
+extraction layer (126 tests).
