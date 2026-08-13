@@ -35,6 +35,17 @@ dev = [
 requires = ["uv_build>=0.12.3,<0.13.0"]
 build-backend = "uv_build"
 
+[tool.uv.build-backend]
+# uv_build's default package discovery only picks the module matching the
+# normalized project name (ai_crawling_pipeline) — radar_pipeline silently
+# never made it into a built wheel. Harmless under `uv run`/`uv sync` (dev
+# mode adds src/ straight to sys.path, bypassing wheel packaging entirely),
+# but a real `pip install .` — e.g. the Docker build — installed a wheel
+# with no radar_pipeline in it, and `radar-pipeline` failed at startup with
+# ModuleNotFoundError. Listing both modules explicitly is what makes a
+# real wheel build actually contain both console scripts' packages.
+module-name = ["ai_crawling_pipeline", "radar_pipeline"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
