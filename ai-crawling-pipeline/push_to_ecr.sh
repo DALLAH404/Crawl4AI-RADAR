@@ -13,8 +13,8 @@
 
 set -euo pipefail
 
-AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-<your-account-id>}"
-AWS_REGION="${AWS_REGION:-<your-region>}"
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-991667603830}"
+AWS_REGION="${AWS_REGION:-eu-west-1}"
 REPO_NAME="${REPO_NAME:-radar-scraper}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 
