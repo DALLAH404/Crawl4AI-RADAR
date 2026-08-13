@@ -510,5 +510,161 @@ Confirm: `aws scheduler get-schedule --name radar-scraper-every-3-hours --region
 
 ---
 
-*(Later phases — verification, read API, frontend — will each add their own section
-here as they're built.)*
+## Phase 5 — Verify end to end
+
+Everything from Phases 1–4 exists now but has never actually run together. This
+phase triggers exactly one Fargate run by hand (no need to wait for the schedule)
+and confirms the whole chain: container starts → reaches the internet → writes to
+DynamoDB → logs land in CloudWatch.
+
+### 1. Trigger one run manually
+
+**Console**: ECS → **Clusters** → `radar-scraper` → **Tasks** tab → **Run new task**.
+
+- **Compute options**: **Launch type** → **FARGATE**.
+- **Application type**: **Task**.
+- **Family**: `radar-scraper`, **Revision**: latest (should be `1` unless you've
+  re-registered it since).
+- **Desired tasks**: `1`.
+- **Networking**: same VPC as Phase 4 → **Subnets**: the same two public subnets →
+  **Security group**: `radar-scraper-sg` → **Auto-assign public IP**: **Turned on**.
+- **Run task**.
+
+**CLI equivalent** (same network config as the Phase 4 schedule target):
+
+```bash
+aws ecs run-task \
+  --cluster radar-scraper \
+  --task-definition radar-scraper \
+  --launch-type FARGATE \
+  --count 1 \
+  --network-configuration '{
+    "awsvpcConfiguration": {
+      "subnets": ["<subnet-id-1>", "<subnet-id-2>"],
+      "securityGroups": ["<sg-id>"],
+      "assignPublicIp": "ENABLED"
+    }
+  }' \
+  --region <REGION>
+```
+
+Note the returned `taskArn` (or the task ID from the console's Tasks tab) — the
+checklist below refers to it as `<task-id>`.
+
+### 2. Checklist
+
+**☐ Container starts and reaches Running.**
+Tasks tab → click the task → **Status** should move Provisioning → Pending →
+Running within roughly a minute. If it goes straight to **Stopped** instead, open
+the task and check **Stopped reason** first — a bad image URI, a role ARN that
+doesn't exist yet, or a missing SSM parameter permission all show up here, before
+you go looking anywhere else.
+
+```bash
+aws ecs describe-tasks --cluster radar-scraper --tasks <task-id> --region <REGION> \
+  --query 'tasks[0].{Status:lastStatus,StoppedReason:stoppedReason}'
+```
+
+**☐ Logs appear in CloudWatch.**
+The task's own **Logs** tab in the ECS console streams them live — no need to jump
+to CloudWatch separately during the run. You should see the structured JSON log
+lines from `setup_logging()` (`{"ts": ..., "level": "INFO", ...}`), progress through
+collect → fetch → dedup → summarize, and end with a `=== Pipeline Summary ===` block.
+Some per-source `ERROR`/`WARNING` lines are expected and not a failure — a handful of
+Google News 503s or a blocked LinkedIn company on any given run is normal (see
+`src/radar_pipeline/README.md`'s anti-block notes); look for the run finishing with
+a summary, not for zero errors.
+
+```bash
+aws logs tail /ecs/radar-scraper --since 30m --region <REGION>
+# add --follow to watch it live instead of a one-shot fetch
+```
+
+**☐ The task finishes with exit code 0.**
+Once `lastStatus` is `STOPPED`, check the container's exit code — a full run takes
+~12–15 minutes, so don't check this too early.
+
+```bash
+aws ecs describe-tasks --cluster radar-scraper --tasks <task-id> --region <REGION> \
+  --query 'tasks[0].containers[0].{ExitCode:exitCode,Reason:reason}'
+```
+
+**☐ New items land in DynamoDB with the expected keys.**
+DynamoDB console → Tables → `radar-articles` → **Explore table items**. You should
+see, per new article: one item with `sk = METADATA` (the base article — `pk` looks
+like `ARTICLE#<32-char-hex-hash>`), one item with `sk` starting `RAWLINK#` next to
+it, and one or more items with `sk` starting `COMPANY#<tag>`. See the [CLI
+spot-checks](#3-spot-check-dynamodb-contents-from-the-cli) below for the same check
+from a terminal.
+
+### 3. Spot-check DynamoDB contents from the CLI
+
+Run these yourself from CloudShell or your machine — swap in a real company tag and
+date range for your data.
+
+**Query `CompanyTimeIndex` (GSI1) for one company across a time range** — this is
+the exact access pattern the Phase 6 read API will use for the per-company feed:
+
+```bash
+aws dynamodb query \
+  --table-name radar-articles \
+  --index-name CompanyTimeIndex \
+  --key-condition-expression "gsi1pk = :pk AND gsi1sk BETWEEN :from AND :to" \
+  --expression-attribute-values '{
+    ":pk": {"S": "COMPANY#Bosch"},
+    ":from": {"S": "2026-08-01"},
+    ":to": {"S": "2026-08-31~"}
+  }' \
+  --region <REGION>
+```
+
+(The trailing `~` on `:to` is a cheap trick, not a typo — each sort key is
+`<timestamp>#<hash>`, and `~` sorts after every character the hash suffix can
+contain, so `2026-08-31~` includes everything published *on* 2026-08-31, not just
+strictly before it.)
+
+**Latest N articles overall** (`LatestIndex`, GSI2 — the homepage feed's query):
+
+```bash
+aws dynamodb query \
+  --table-name radar-articles \
+  --index-name LatestIndex \
+  --key-condition-expression "gsi2pk = :pk" \
+  --expression-attribute-values '{":pk": {"S": "ARTICLE"}}' \
+  --scan-index-forward false \
+  --limit 10 \
+  --region <REGION>
+```
+
+**Fetch one article directly**, if you have its hash (e.g. from the query results
+above, or from a CloudWatch log line):
+
+```bash
+aws dynamodb get-item \
+  --table-name radar-articles \
+  --key '{"pk": {"S": "ARTICLE#<article_hash>"}, "sk": {"S": "METADATA"}}' \
+  --region <REGION>
+```
+
+**Rough total article count** (a `Scan`, filtered to base items only so
+company-link/raw-link-pointer items aren't double-counted — fine for an occasional
+manual check at this data volume, not something to run on a schedule):
+
+```bash
+aws dynamodb scan \
+  --table-name radar-articles \
+  --filter-expression "sk = :sk" \
+  --expression-attribute-values '{":sk": {"S": "METADATA"}}' \
+  --select COUNT \
+  --region <REGION>
+```
+
+If the company query in the first command comes back empty but the latest-overall
+query doesn't, check that the company tag matches `configs/radar_sources.yaml`'s
+`tag:` field exactly (case-sensitive) — that's the most common reason for an
+otherwise-successful run to look empty from one angle only.
+
+---
+
+*(Later phases — read API, frontend — will each add their own section here as
+they're built.)*
