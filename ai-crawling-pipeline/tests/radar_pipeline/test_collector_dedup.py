@@ -9,21 +9,13 @@ short-circuit the resolver.
 
 from __future__ import annotations
 
-import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
 
 import httpx
 import pytest
 
 from radar_pipeline.config import CollectSettings
-from radar_pipeline.db import (
-    connect,
-    find_by_raw_link,
-    init_schema,
-    insert_article,
-    insert_source,
-)
+from radar_pipeline.db import find_by_raw_link, put_article
 from radar_pipeline.models import Article, Source
 
 
@@ -60,31 +52,28 @@ def _make_article(link: str, raw_link: str, title: str) -> Article:
         ingestion_batch_id="batch-x",
         source_id="t",
         source_name="t",
+        feed_type="google_news_query",
     )
 
 
 @pytest.mark.asyncio
-async def test_known_raw_link_skips_resolver(monkeypatch):
+async def test_known_raw_link_skips_resolver(store, monkeypatch):
     """Insert one article with raw_link = https://news.google.com/articles/EXISTING.
 
     Run a collect; the resolver spy should be called for the OTHER item
     only — never for the one we already saw.
     """
-    con = connect(Path(tempfile.mktemp(suffix=".db")))
-    init_schema(con, dim=768)
+    put_article(store, _make_article(
+        link="https://real.example.com/old",
+        raw_link="https://news.google.com/articles/EXISTING",
+        title="Bosch antiga linha amortecedor",
+    ))
+
     s = Source(
         source_id="t", name="t", source_type="concorrente",
         tag="t", product_line="Geral", category="auto",
         feed_type="google_news_query", query_text="x",
     )
-    insert_source(con, s)
-
-    insert_article(con, _make_article(
-        link="https://real.example.com/old",
-        raw_link="https://news.google.com/articles/EXISTING",
-        title="Bosch antiga linha amortecedor",
-    ))
-    con.commit()
 
     # Mock the feed transport: always returns RSS_BODY.
     def feed_handler(request: httpx.Request) -> httpx.Response:
@@ -132,18 +121,16 @@ async def test_known_raw_link_skips_resolver(monkeypatch):
     monkeypatch.setattr(gnews_mod.httpx, "AsyncClient", _TransportClient)
     monkeypatch.setattr(fp.httpx, "AsyncClient", _TransportClient)
 
-    stats = await coll.collect_once(con, cfg, mode="normal")
+    stats = await coll.collect_once(store, [s], cfg, mode="normal")
 
     # Crucial assertion: resolver was NOT called for the EXISTING item
-    # because find_by_raw_link hit the DB first.
+    # because find_by_raw_link hit the store first.
     assert "https://news.google.com/articles/EXISTING" not in feed_calls, (
         feed_calls
     )
     assert "https://news.google.com/articles/NEW" in feed_calls
 
     # And the new article was inserted.
-    row = find_by_raw_link(con, "https://news.google.com/articles/NEW")
+    row = find_by_raw_link(store, "https://news.google.com/articles/NEW")
     assert row is not None
     assert row["link"] == "https://real.example.com/resolved-NEW"
-
-    con.close()

@@ -3,34 +3,27 @@
 Confirms a linkedin_company source routes through fetch_company_posts (not
 fetch_and_parse / resolve_google_news_url), that raw post URLs are used
 as-is (no Google News resolution), and that the `extra` JSON payload
-round-trips into the inserted article row.
+round-trips into the inserted article.
 """
 
 from __future__ import annotations
 
 import json
-import tempfile
-from pathlib import Path
 
 import pytest
 
 from radar_pipeline.config import CollectSettings
-from radar_pipeline.db import connect, init_schema, insert_source
+from radar_pipeline.db import get_article, latest_articles
 from radar_pipeline.models import Source
 
 
 @pytest.mark.asyncio
-async def test_linkedin_source_skips_resolver_and_stores_extra(monkeypatch):
-    con = connect(Path(tempfile.mktemp(suffix=".db")))
-    init_schema(con, dim=768)
-
+async def test_linkedin_source_skips_resolver_and_stores_extra(store, monkeypatch):
     s = Source(
         source_id="bosch-li", name="Bosch LinkedIn", source_type="concorrente",
         tag="Bosch", product_line="Geral", category="auto",
         feed_type="linkedin_company", query_text="bosch",
     )
-    insert_source(con, s)
-    con.commit()
 
     from radar_pipeline.sources import collector as coll
 
@@ -59,17 +52,16 @@ async def test_linkedin_source_skips_resolver_and_stores_extra(monkeypatch):
     cfg.linkedin.delay_seconds = 0.0
     cfg.linkedin.jitter_seconds = 0.0
 
-    stats = await coll.collect_once(con, cfg, mode="normal")
+    stats = await coll.collect_once(store, [s], cfg, mode="normal")
 
     assert resolver_calls == []
     assert stats.items_new == 1
     assert stats.sources_ok == 1
 
-    row = con.execute(
-        "SELECT * FROM articles WHERE link = ?",
-        ("https://www.linkedin.com/posts/bosch_activity-1",),
-    ).fetchone()
-    assert row is not None
+    articles = latest_articles(store, limit=10)
+    assert len(articles) == 1
+    row = articles[0]
+    assert row["link"] == "https://www.linkedin.com/posts/bosch_activity-1"
     assert row["raw_link"] == row["link"]
     assert row["title"] == "Bosch launches a new brake pad line"
     assert row["action_description"] == (
@@ -78,21 +70,14 @@ async def test_linkedin_source_skips_resolver_and_stores_extra(monkeypatch):
     extra = json.loads(row["extra"])
     assert extra["reactions"] == 12
 
-    con.close()
-
 
 @pytest.mark.asyncio
-async def test_linkedin_media_only_post_falls_back_to_source_name_title(monkeypatch):
-    con = connect(Path(tempfile.mktemp(suffix=".db")))
-    init_schema(con, dim=768)
-
+async def test_linkedin_media_only_post_falls_back_to_source_name_title(store, monkeypatch):
     s = Source(
         source_id="valeo-li", name="Valeo LinkedIn", source_type="concorrente",
         tag="Valeo", product_line="Geral", category="auto",
         feed_type="linkedin_company", query_text="valeo",
     )
-    insert_source(con, s)
-    con.commit()
 
     from radar_pipeline.sources import collector as coll
 
@@ -113,14 +98,9 @@ async def test_linkedin_media_only_post_falls_back_to_source_name_title(monkeypa
     cfg.linkedin.delay_seconds = 0.0
     cfg.linkedin.jitter_seconds = 0.0
 
-    stats = await coll.collect_once(con, cfg, mode="normal")
+    stats = await coll.collect_once(store, [s], cfg, mode="normal")
 
     assert stats.items_new == 1
-    row = con.execute(
-        "SELECT * FROM articles WHERE link = ?",
-        ("https://www.linkedin.com/posts/valeo_activity-2",),
-    ).fetchone()
-    assert row is not None
-    assert row["title"] == "Valeo LinkedIn LinkedIn post"
-
-    con.close()
+    articles = latest_articles(store, limit=10)
+    assert len(articles) == 1
+    assert articles[0]["title"] == "Valeo LinkedIn LinkedIn post"

@@ -1,54 +1,27 @@
-"""Tests for the database schema and helpers."""
+"""Tests for the DynamoDB storage layer."""
 
-import pytest
-import tempfile
-from pathlib import Path
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from boto3.dynamodb.conditions import Key
 
 from radar_pipeline.db import (
-    connect,
     find_by_article_hash,
     find_by_raw_link,
-    get_active_sources,
-    init_schema,
-    insert_article,
+    find_by_title_hash_within,
+    get_article,
+    latest_articles,
     mark_article_irrelevant,
+    articles_for_company,
     pending_articles,
+    put_article,
+    update_article,
 )
-from radar_pipeline.models import Article, Source
+from radar_pipeline.models import Article
 
 
-@pytest.fixture
-def db_conn():
-    path = Path(tempfile.mktemp(suffix=".db"))
-    con = connect(path)
-    init_schema(con, dim=768)
-    yield con
-    con.close()
-    path.unlink(missing_ok=True)
-
-
-@pytest.fixture
-def db_with_source(db_conn):
-    from radar_pipeline.db import insert_source
-
-    s = Source(
-        source_id="test-source",
-        name="Test Source",
-        source_type="concorrente",
-        tag="Test",
-        product_line="Geral",
-        category="auto",
-        feed_type="google_news_query",
-        query_text="test query",
-    )
-    insert_source(db_conn, s)
-    db_conn.commit()
-    return db_conn
-
-
-def _make_article(source_id: str = "test-source", **kwargs) -> Article:
-    from datetime import datetime, timezone
-
+def _make_article(**kwargs) -> Article:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     defaults = {
         "article_hash": "abc123",
@@ -56,244 +29,154 @@ def _make_article(source_id: str = "test-source", **kwargs) -> Article:
         "published_at": "2026-08-01",
         "collected_at": now,
         "category": "auto",
+        "competitor_tag": "Test",
         "title": "Test article",
         "link": "https://example.com/test",
-        "source_id": source_id,
+        "source_id": "test-source",
         "source_name": "Test Source",
+        "feed_type": "google_news_query",
     }
     defaults.update(kwargs)
     return Article(**defaults)
 
 
-class TestSchema:
-    def test_tables_exist(self, db_conn):
-        tables = db_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        ).fetchall()
-        names = {r[0] for r in tables}
-        assert "sources" in names
-        assert "articles" in names
-        assert "collection_runs" in names
-        assert "schema_version" in names
-
-    def test_views_exist(self, db_conn):
-        views = db_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='view' ORDER BY name"
-        ).fetchall()
-        names = {r[0] for r in views}
-        assert "vw_source_health_daily" in names
-        assert "vw_stale_sources" in names
-
-    def test_vec_table_exists(self, db_conn):
-        tables = db_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        ).fetchall()
-        assert "vec_articles" in {r[0] for r in tables}
-
-    def test_fts_table_exists(self, db_conn):
-        tables = db_conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        ).fetchall()
-        assert "articles_fts" in {r[0] for r in tables}
-
-
-class TestSources:
-    def test_source_insert_and_query(self, db_conn):
-        from radar_pipeline.db import insert_source
-
-        s = Source(
-            source_id="test-bosch",
-            name="Bosch Test",
-            source_type="concorrente",
-            tag="Bosch",
-            product_line="Eletrica",
-            category="auto",
-            feed_type="google_news_query",
-            query_text="Bosch autopecas",
-        )
-        insert_source(db_conn, s)
-        db_conn.commit()
-
-        active = get_active_sources(db_conn)
-        assert len(active) == 1
-        assert active[0]["source_id"] == "test-bosch"
+class TestTable:
+    def test_gsis_exist(self, store):
+        desc = store.table.meta.client.describe_table(TableName=store.table.table_name)
+        gsi_names = {g["IndexName"] for g in desc["Table"].get("GlobalSecondaryIndexes", [])}
+        assert gsi_names == {"CompanyTimeIndex", "LatestIndex", "DedupIndex", "PendingIndex"}
 
 
 class TestArticles:
-    def test_insert_and_dedup(self, db_with_source):
-        a1 = _make_article(article_hash="abc123def456", link="https://example.com/article-1")
-        rowid1 = insert_article(db_with_source, a1)
-        assert rowid1 is not None
-
-        a2 = _make_article(article_hash="abc123def456", link="https://example.com/dupe")
-        rowid2 = insert_article(db_with_source, a2)
-        assert rowid2 is None
-
-    def test_find_by_hash(self, db_with_source):
+    def test_insert_and_get(self, store):
         a = _make_article(article_hash="xyz789", link="https://example.com/findme")
-        insert_article(db_with_source, a)
+        assert put_article(store, a) is True
 
-        found = find_by_article_hash(db_with_source, "xyz789")
+        found = get_article(store, "xyz789")
         assert found is not None
         assert found["title"] == "Test article"
 
-        not_found = find_by_article_hash(db_with_source, "nonexistent")
-        assert not_found is None
+    def test_idempotent_insert_does_not_duplicate(self, store):
+        """Phase 1 requirement: running the same insert twice must not create
+        a duplicate item — the second call is a no-op, not a second row."""
+        a1 = _make_article(article_hash="dupe-hash", link="https://example.com/article-1")
+        a2 = _make_article(article_hash="dupe-hash", link="https://example.com/a-different-url-but-same-hash")
 
-    def test_find_by_raw_link(self, db_with_source):
-        a = _make_article(
+        assert put_article(store, a1) is True
+        assert put_article(store, a2) is False  # rejected: article_hash already exists
+
+        # Exactly one item under this hash, and it's the FIRST write's data
+        # (a conditional put never overwrites — a re-run doesn't clobber
+        # fields another process may have already updated, e.g. a summary).
+        found = get_article(store, "dupe-hash")
+        assert found["link"] == "https://example.com/article-1"
+
+        resp = store.table.query(
+            KeyConditionExpression=Key("pk").eq("ARTICLE#dupe-hash")
+        )
+        base_items = [i for i in resp["Items"] if i["sk"] == "METADATA"]
+        assert len(base_items) == 1
+
+    def test_find_by_hash(self, store):
+        put_article(store, _make_article(article_hash="xyz789", link="https://example.com/findme"))
+
+        found = find_by_article_hash(store, "xyz789")
+        assert found is not None
+        assert found["title"] == "Test article"
+
+        assert find_by_article_hash(store, "nonexistent") is None
+
+    def test_find_by_raw_link(self, store):
+        put_article(store, _make_article(
             article_hash="rawlinkhash",
             link="https://real.example.com/resolved",
             raw_link="https://news.google.com/articles/abc",
-        )
-        insert_article(db_with_source, a)
+        ))
 
-        found = find_by_raw_link(
-            db_with_source, "https://news.google.com/articles/abc",
-        )
+        found = find_by_raw_link(store, "https://news.google.com/articles/abc")
         assert found is not None
         assert found["link"] == "https://real.example.com/resolved"
 
-        not_found = find_by_raw_link(db_with_source, "https://nope.example/")
-        assert not_found is None
+        assert find_by_raw_link(store, "https://nope.example/") is None
 
-    def test_find_by_raw_link_empty_returns_none(self, db_with_source):
-        assert find_by_raw_link(db_with_source, "") is None
+    def test_find_by_raw_link_empty_returns_none(self, store):
+        assert find_by_raw_link(store, "") is None
 
-    def test_irrelevant_is_excluded_from_search(self, db_with_source):
-        a = _make_article(article_hash="irrelevant-one", link="https://example.com/irrel")
-        rowid = insert_article(db_with_source, a)
-        assert rowid is not None
+    def test_irrelevant_is_excluded_from_dedup_lookups(self, store):
+        put_article(store, _make_article(article_hash="irrelevant-one", link="https://example.com/irrel"))
 
-        found_before = find_by_article_hash(db_with_source, "irrelevant-one")
-        assert found_before is not None
+        assert find_by_article_hash(store, "irrelevant-one") is not None
 
-        mark_article_irrelevant(db_with_source, rowid)
-        db_with_source.commit()
+        mark_article_irrelevant(store, "irrelevant-one")
 
-        found_after = find_by_article_hash(db_with_source, "irrelevant-one")
-        assert found_after is None
+        assert find_by_article_hash(store, "irrelevant-one") is None
+        # ...but the article itself is still readable directly.
+        assert get_article(store, "irrelevant-one")["summary_status"] == "irrelevant"
 
-    def test_pending_articles(self, db_with_source):
+    def test_find_by_title_hash_within_window(self, store):
+        put_article(store, _make_article(
+            article_hash="title-a", title_hash="shared-title-hash",
+            published_at="2026-08-10T12:00:00Z",
+        ))
+
+        found = find_by_title_hash_within(store, "shared-title-hash", "2026-08-01T00:00:00Z")
+        assert found is not None
+        assert found["article_hash"] == "title-a"
+
+        assert find_by_title_hash_within(store, "shared-title-hash", "2026-08-15T00:00:00Z") is None
+
+    def test_pending_articles(self, store):
         for i in range(3):
-            a = _make_article(
-                article_hash=f"pending{i}",
-                link=f"https://example.com/art{i}",
+            put_article(store, _make_article(
+                article_hash=f"pending{i}", link=f"https://example.com/art{i}",
                 summary_status="pending",
-            )
-            insert_article(db_with_source, a)
-
-        a_gen = _make_article(
-            article_hash="generated",
-            link="https://example.com/done",
+            ))
+        put_article(store, _make_article(
+            article_hash="generated", link="https://example.com/done",
             summary_status="ai_generated",
-        )
-        insert_article(db_with_source, a_gen)
+        ))
 
-        pending = pending_articles(db_with_source)
+        pending = pending_articles(store)
         assert len(pending) == 3
 
-    def test_pending_articles_includes_feed_type(self, db_with_source):
-        a = _make_article(article_hash="with-feed-type", link="https://example.com/ft")
-        insert_article(db_with_source, a)
+    def test_pending_articles_includes_feed_type(self, store):
+        put_article(store, _make_article(article_hash="with-feed-type", link="https://example.com/ft"))
 
-        pending = pending_articles(db_with_source)
+        pending = pending_articles(store)
         assert pending[0]["feed_type"] == "google_news_query"
 
+    def test_update_article_removes_from_pending_index(self, store):
+        put_article(store, _make_article(article_hash="to-summarize", link="https://example.com/s"))
+        assert len(pending_articles(store)) == 1
 
-class TestLinkedInFeedType:
-    def test_insert_source_with_linkedin_feed_type(self, db_conn):
-        from radar_pipeline.db import insert_source
+        update_article(store, "to-summarize", summary_status="ai_generated")
+        assert len(pending_articles(store)) == 0
 
-        s = Source(
-            source_id="test-linkedin",
-            name="Bosch LinkedIn",
-            source_type="concorrente",
-            tag="Bosch",
-            product_line="Geral",
-            category="auto",
-            feed_type="linkedin_company",
-            query_text="bosch",
-        )
-        insert_source(db_conn, s)
-        db_conn.commit()
+    def test_latest_articles_ordering(self, store):
+        put_article(store, _make_article(article_hash="older", link="https://example.com/1", published_at="2026-08-01"))
+        put_article(store, _make_article(article_hash="newer", link="https://example.com/2", published_at="2026-08-10"))
 
-        active = get_active_sources(db_conn)
-        assert len(active) == 1
-        assert active[0]["feed_type"] == "linkedin_company"
+        latest = latest_articles(store, limit=10)
+        assert [a["article_hash"] for a in latest] == ["newer", "older"]
 
+    def test_articles_for_company_time_range(self, store):
+        put_article(store, _make_article(
+            article_hash="bosch-1", competitor_tag="Bosch",
+            link="https://example.com/b1", published_at="2026-08-05",
+        ))
+        put_article(store, _make_article(
+            article_hash="valeo-1", competitor_tag="Valeo",
+            link="https://example.com/v1", published_at="2026-08-05",
+        ))
 
-class TestMigration0002:
-    def test_widens_feed_type_check_and_preserves_rows(self):
-        import pysqlite3 as sqlite3
+        bosch = articles_for_company(store, "Bosch", since_ts="2026-08-01")
+        assert [a["article_hash"] for a in bosch] == ["bosch-1"]
 
-        from radar_pipeline.migrations import migration_0002
+    def test_multi_company_article_appears_in_both_feeds(self, store):
+        put_article(store, _make_article(
+            article_hash="shared", competitor_tag="Bosch,Valeo",
+            link="https://example.com/shared", published_at="2026-08-05",
+        ))
 
-        con = sqlite3.connect(":memory:")
-        con.row_factory = sqlite3.Row
-        con.executescript("""
-            CREATE TABLE schema_version (
-                version INTEGER PRIMARY KEY,
-                applied_at TEXT
-            );
-            INSERT INTO schema_version (version) VALUES (1);
-
-            CREATE TABLE sources (
-                source_id     TEXT PRIMARY KEY,
-                name          TEXT NOT NULL,
-                source_type   TEXT CHECK(source_type IN
-                              ('portal','entidade','concorrente','tema','tecnologia','economia','lancamento')),
-                tag           TEXT,
-                product_line  TEXT,
-                category      TEXT CHECK(category IN ('auto','economia','tecnologia')),
-                feed_type     TEXT CHECK(feed_type IN ('rss_direct','google_news_query')),
-                rss_url       TEXT,
-                query_text    TEXT,
-                active        INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
-                created_at    TEXT,
-                updated_at    TEXT
-            );
-
-            INSERT INTO sources (
-                source_id, name, source_type, tag, product_line, category,
-                feed_type, rss_url, query_text, active, created_at
-            ) VALUES (
-                'existing-source', 'Existing', 'concorrente', 'X', 'Geral', 'auto',
-                'google_news_query', '', 'query', 1, '2026-01-01T00:00:00Z'
-            );
-        """)
-        con.commit()
-
-        with pytest.raises(sqlite3.IntegrityError):
-            con.execute(
-                "INSERT INTO sources (source_id, name, source_type, category, feed_type, active) "
-                "VALUES ('li', 'LI', 'concorrente', 'auto', 'linkedin_company', 1)"
-            )
-
-        migration_0002.apply(con)
-
-        row = con.execute(
-            "SELECT * FROM sources WHERE source_id = 'existing-source'"
-        ).fetchone()
-        assert row is not None
-        assert row["feed_type"] == "google_news_query"
-
-        con.execute(
-            "INSERT INTO sources (source_id, name, source_type, category, feed_type, active) "
-            "VALUES ('li', 'LI', 'concorrente', 'auto', 'linkedin_company', 1)"
-        )
-        con.commit()
-        row2 = con.execute(
-            "SELECT feed_type FROM sources WHERE source_id = 'li'"
-        ).fetchone()
-        assert row2["feed_type"] == "linkedin_company"
-
-        con.close()
-
-    def test_idempotent_on_already_migrated_table(self, db_conn):
-        from radar_pipeline.migrations import migration_0002
-
-        count_before = db_conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
-        migration_0002.apply(db_conn)
-        count_after = db_conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
-        assert count_before == count_after
+        assert [a["article_hash"] for a in articles_for_company(store, "Bosch", "2026-08-01")] == ["shared"]
+        assert [a["article_hash"] for a in articles_for_company(store, "Valeo", "2026-08-01")] == ["shared"]
