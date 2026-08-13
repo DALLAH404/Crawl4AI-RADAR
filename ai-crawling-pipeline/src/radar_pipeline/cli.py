@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import dataclasses
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -266,7 +267,14 @@ def main() -> None:
     needs_store = args.collect or args.classify or args.fetch or args.dedup or args.summarize or args.status
     store = None
     if needs_store:
-        store = connect(config.db.table_name, config.db.region_name or None, config.db.endpoint_url or None)
+        # RADAR_TABLE_NAME lets the same image target a different table per
+        # environment (e.g. a dev table) via the ECS task definition's
+        # environment variables, without rebuilding the image or shipping a
+        # different configs/radar.yaml. Region needs no equivalent override
+        # here — boto3 already resolves AWS_DEFAULT_REGION on its own when
+        # region_name isn't passed explicitly.
+        table_name = os.environ.get("RADAR_TABLE_NAME") or config.db.table_name
+        store = connect(table_name, config.db.region_name or None, config.db.endpoint_url or None)
         if config.db.endpoint_url:
             # Local/dev endpoint (dynamodb-local, moto) — create the table if
             # it's missing. Against real AWS the table is created once via
