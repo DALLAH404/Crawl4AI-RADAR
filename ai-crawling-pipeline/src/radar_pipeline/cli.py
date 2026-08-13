@@ -245,13 +245,6 @@ def main() -> None:
     if args.hours_back is not None:
         config.collect.hours_back = args.hours_back
 
-    store = connect(config.db.table_name, config.db.region_name or None, config.db.endpoint_url or None)
-    if config.db.endpoint_url:
-        # Local/dev endpoint (dynamodb-local, moto) — create the table if
-        # it's missing. Against real AWS the table is created once via the
-        # console/CLI steps in DEPLOYMENT.md, not by the app on every boot.
-        ensure_table(store)
-
     metrics = MetricsCollector()
 
     stage_flags = [
@@ -265,6 +258,21 @@ def main() -> None:
         args.collect = args.fetch = args.dedup = args.summarize = True
 
     mode = "backfill" if args.backfill else "normal"
+
+    # sources-list and --validate-feeds only ever touch the YAML catalog /
+    # outbound feed URLs — never the store — so they shouldn't need a
+    # DynamoDB connection (or a region/credentials) at all. Connect lazily,
+    # only for the stages that actually read or write articles.
+    needs_store = args.collect or args.classify or args.fetch or args.dedup or args.summarize or args.status
+    store = None
+    if needs_store:
+        store = connect(config.db.table_name, config.db.region_name or None, config.db.endpoint_url or None)
+        if config.db.endpoint_url:
+            # Local/dev endpoint (dynamodb-local, moto) — create the table if
+            # it's missing. Against real AWS the table is created once via
+            # the console/CLI steps in DEPLOYMENT.md, not by the app on every
+            # boot.
+            ensure_table(store)
 
     try:
         if args.collect:
