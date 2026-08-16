@@ -941,4 +941,94 @@ error status means something in steps 1–3 above needs a second look.
 
 ---
 
+## Addendum — News/Social split: a new GSI + a migration + a Lambda code update
+
+Added after Phase 6: articles are now tagged `content_kind` (`news` or `social`) so
+the frontend can filter by that dimension, combinable with the company filter. Full
+design in `src/radar_pipeline/README.md`'s "Content kind" section; this is the
+AWS-side setup for it. Three things, in order — all needed, since the table, the
+scraper's data, and the already-deployed read API all predate this field.
+
+### 1. Add the KindIndex GSI to the existing table
+
+**Console**: DynamoDB → Tables → `radar-articles` → **Indexes** tab → **Create
+index**.
+- **Partition key**: `gsi5pk` (String). **Sort key**: `gsi5sk` (String).
+- **Index name**: `KindIndex`.
+- **Projected attributes**: **All** (same as the other four).
+- **Create index**. Wait for **Status: Active** (backfills near-instantly since
+  it's a brand new attribute pair, nothing existing has it yet).
+
+**CLI equivalent**:
+
+```bash
+aws dynamodb update-table \
+  --table-name radar-articles \
+  --attribute-definitions \
+      AttributeName=gsi5pk,AttributeType=S \
+      AttributeName=gsi5sk,AttributeType=S \
+  --global-secondary-index-updates \
+      '[{"Create":{"IndexName":"KindIndex","KeySchema":[{"AttributeName":"gsi5pk","KeyType":"HASH"},{"AttributeName":"gsi5sk","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}}]' \
+  --region <REGION>
+```
+
+**Confirm it worked**: `aws dynamodb describe-table --table-name radar-articles
+--region <REGION> --query 'Table.GlobalSecondaryIndexes[].{Name:IndexName,Status:IndexStatus}'`
+should list `KindIndex` at `ACTIVE` alongside the other four.
+
+No IAM changes needed for this step — both the scraper's task role and the read
+API's role already scope their DynamoDB actions to `table/radar-articles/index/*`
+(a wildcard), which automatically covers any new index.
+
+### 2. Backfill content_kind on existing articles
+
+Same idea as the `PendingIndex` scheme migration from earlier: articles collected
+before this field existed have neither `content_kind` nor a `gsi5pk` at all, so
+they're invisible to any kind-filtered query until rewritten.
+
+```bash
+cd ai-crawling-pipeline
+python scripts/migrate_content_kind.py --table-name radar-articles --region <REGION>
+```
+
+(No `pip install -e .` needed if your environment's Python is older than 3.12 —
+same `PYTHONPATH=src python scripts/migrate_content_kind.py ...` workaround as
+before works here too.) It prints how many articles it found and rewrote, inferring
+`news` vs. `social` from each article's own `feed_type`.
+
+**Confirm it worked**: `aws dynamodb query --table-name radar-articles --index-name
+KindIndex --key-condition-expression "gsi5pk = :k" --expression-attribute-values
+'{":k":{"S":"KIND#social"}}' --region <REGION>` should return your LinkedIn
+articles.
+
+### 3. Update the read API Lambda's code
+
+`read-api/lambda_function.py` changed (the `kind` query param, `KindIndex`, and the
+company+kind filter). If you already created the Lambda in Phase 6, it's running
+the old code — update it:
+
+**Console**: Lambda → `radar-scraper-read-api` → **Code** tab → replace the inline
+editor's contents with the current `lambda_function.py` → **Deploy**.
+
+**CLI equivalent**:
+
+```bash
+cd read-api
+zip -f function.zip lambda_function.py  # -f: update in place; add it fresh if the zip doesn't exist yet
+aws lambda update-function-code --function-name radar-scraper-read-api \
+  --zip-file fileb://function.zip --region <REGION>
+```
+
+**Confirm it worked**:
+
+```bash
+curl "https://<api-id>.execute-api.<region>.amazonaws.com/articles?kind=social&limit=5"
+curl "https://<api-id>.execute-api.<region>.amazonaws.com/articles?company=Bosch&kind=news"
+```
+
+Both should return real data (once steps 1–2 above have run) rather than an error or
+an empty list.
+
+---
+
 *(Phase 7 — frontend — will add its own section here once it's built.)*
