@@ -59,8 +59,12 @@ behaviours:
   overridable per-run via `--companies`, `--hours-back`, `--backfill` without editing
   the YAML.
 - **Source types** — `rss_direct` (uses `rss_url` verbatim), `google_news_query`
-  (builds a Google News RSS URL from `query_text`, optionally with a `when:Nd`/`when:Nh`
-  date filter), and `linkedin_company` (scrapes the logged-out LinkedIn "About" page for
+  (builds a Google News RSS URL from `query_text`, no `when:` recency operator —
+  Google's search backend returns zero results for several of our real configured
+  queries once `when:` is added, at every window size tried, while the identical
+  query without it works; `_process_source`'s own `cutoff`-by-`published_at` filter
+  and `find_by_raw_link` dedup already do the actual recency scoping downstream),
+  and `linkedin_company` (scrapes the logged-out LinkedIn "About" page for
   `query_text`, treated as a company slug — see [LinkedIn sources](#linkedin-sources)
   below).
 - **Two collection passes** — RSS/Google-News sources are gathered together, bounded
@@ -410,7 +414,7 @@ addition (`content_kind: social`), not a code change to that inference rule.
 | Variable        | Used by                                  |
 |-----------------|------------------------------------------|
 | `GEMINI_API_KEY`| `GeminiEmbedder` (Layer 3, currently unused). |
-| `OPENAI_API_KEY`| `summarize/client.AsyncOpenAI` and `dedup/judge.judge` (Layer 4, currently unused). |
+| `OPENAI_API_KEY`| `summarize/client.AsyncOpenAI` and `dedup/judge.judge` (Layer 4, currently unused) — name comes from `summarize.llm.api_key_env`/`dedup.judge_llm.api_key_env` in `configs/radar.yaml`, not hardcoded; must be a key issued by whichever provider `base_url` actually points at (an OpenCode Zen key, currently — see the "Environment variables" note in Phase 3 of `DEPLOYMENT.md`), not just any OpenAI-shaped key. |
 | `RADAR_TABLE_NAME` | Overrides `db.table_name` — set per environment via the task definition without rebuilding the image. |
 | `RADAR_FETCH_S3_BUCKET` | Overrides `fetch.s3.bucket` the same way; unset means whatever (if anything) `fetch.s3.bucket` says in the YAML. |
 

@@ -65,13 +65,21 @@ def _gnews_url(query: str) -> str:
     )
 
 
-def _feed_url(
-    source: dict[str, Any],
-    mode: str,
-    days_back: int,
-    backfill_days: int,
-    hours_back: int | None = None,
-) -> str:
+def _feed_url(source: dict[str, Any]) -> str:
+    """Google News RSS search URL for a query-based source — deliberately
+    with no `when:` recency operator. Google's search backend returns zero
+    results for several of our exact configured queries (confirmed live,
+    reproduced cleanly with pauses to rule out rate-limiting: e.g.
+    "Bosch autopeças OR aftermarket Brasil" returns 50-60+ items with no
+    `when:` at all, and 0 items with `when:3h`, `when:7d`, or `when:30d` —
+    same query, every window size, all zero) while the identical query
+    without `when:` works every time. There's no query-shape rule that
+    predicts which ones break, so rather than gamble per-source, this never
+    asks Google to time-scope results at all. `_process_source`'s own
+    `cutoff` filter (by each item's real `published_at`) already discards
+    anything outside the actual collection window downstream, and
+    `find_by_raw_link` dedups the rest — recency scoping doesn't depend on
+    Google's `when:` operator working."""
     if source["feed_type"] == "linkedin_company":
         return company_page_url(source["query_text"])
 
@@ -79,13 +87,6 @@ def _feed_url(
         return source["rss_url"]
 
     q = source["query_text"] or source["tag"] or source["name"]
-    if mode == "backfill":
-        q += f" when:{backfill_days}d"
-    elif hours_back is not None:
-        q += f" when:{hours_back}h"
-    elif days_back > 0:
-        q += f" when:{days_back}d"
-
     return _gnews_url(q)
 
 
@@ -110,7 +111,6 @@ def _build_linkedin_limiter(config) -> RateLimiter:
 
 async def _fetch_items(
     source: dict[str, Any],
-    mode: str,
     client: httpx.AsyncClient,
     limiter: RateLimiter,
     config,
@@ -127,11 +127,9 @@ async def _fetch_items(
                 source["query_text"], limiter=limiter, settings=config.linkedin,
             )
         except LinkedInBlockedError as exc:
-            raise FeedFetchError(f"linkedin blocked: {exc.reason}", url=_feed_url(
-                source, mode, config.days_back, config.backfill_days, config.hours_back,
-            )) from exc
+            raise FeedFetchError(f"linkedin blocked: {exc.reason}", url=_feed_url(source)) from exc
 
-    url = _feed_url(source, mode, config.days_back, config.backfill_days, config.hours_back)
+    url = _feed_url(source)
     try:
         return await fetch_and_parse(
             url,
@@ -169,7 +167,7 @@ async def _process_source(
     is_linkedin = source["feed_type"] == "linkedin_company"
 
     try:
-        items = await _fetch_items(source, mode, client, limiter, config)
+        items = await _fetch_items(source, client, limiter, config)
 
         run.items_found = len(items)
 

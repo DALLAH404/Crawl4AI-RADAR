@@ -5,6 +5,18 @@ import { useRouter, useSearchParams, usePathname } from "next/navigation";
 import { COMPANIES } from "@/lib/companies";
 import { companyColor } from "@/lib/companyColor";
 
+const WATCHLIST_KEY = "radar:watchlist";
+
+function readWatchlist(): string[] {
+  try {
+    const saved = localStorage.getItem(WATCHLIST_KEY);
+    const parsed = saved ? JSON.parse(saved) : [];
+    return Array.isArray(parsed) ? parsed.filter((v) => typeof v === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 export function CompanyFilter() {
   const router = useRouter();
   const pathname = usePathname();
@@ -17,6 +29,21 @@ export function CompanyFilter() {
     return raw ? raw.split(",").filter(Boolean) : [];
   }, [searchParams]);
 
+  // Restore the saved watchlist whenever the URL has no company filter of
+  // its own — router.replace (not push) since this is resuming state, not
+  // a fresh navigation the user should have to "back" out of. Naturally
+  // only fires once per empty-filter visit: applying it changes
+  // searchParams, which re-runs this effect and immediately short-circuits
+  // on the now-present company param.
+  useEffect(() => {
+    if (searchParams.get("company")) return;
+    const watchlist = readWatchlist();
+    if (watchlist.length === 0) return;
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("company", watchlist.join(","));
+    router.replace(`${pathname}?${params}`, { scroll: false });
+  }, [searchParams, pathname, router]);
+
   useEffect(() => {
     function onClickOutside(event: MouseEvent) {
       if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
@@ -28,6 +55,11 @@ export function CompanyFilter() {
   }, []);
 
   function applySelection(next: string[]) {
+    if (next.length) {
+      localStorage.setItem(WATCHLIST_KEY, JSON.stringify(next));
+    } else {
+      localStorage.removeItem(WATCHLIST_KEY);
+    }
     const params = new URLSearchParams(searchParams.toString());
     if (next.length) {
       params.set("company", next.join(","));
@@ -50,7 +82,7 @@ export function CompanyFilter() {
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-1.5 text-sm font-medium text-card-foreground hover:bg-accent hover:text-accent-foreground"
+        className="flex w-full items-center justify-between rounded-md border border-border bg-card px-2 py-1.5 text-sm font-medium text-card-foreground hover:bg-accent hover:text-accent-foreground"
       >
         Companies{selected.length ? ` (${selected.length})` : ""}
         <svg
@@ -66,11 +98,9 @@ export function CompanyFilter() {
       </button>
 
       {open && (
-        <div className="absolute z-20 mt-2 max-h-80 w-64 overflow-y-auto rounded-lg border border-border bg-popover p-2 shadow-lg">
+        <div className="absolute z-20 mt-2 max-h-96 w-full min-w-64 overflow-y-auto rounded-lg border border-border bg-popover p-2 shadow-lg">
           <div className="flex items-center justify-between px-2 pb-2">
-            <span className="text-xs font-medium text-muted-foreground">
-              Filter by company
-            </span>
+            <span className="text-xs font-medium text-muted-foreground">Filter by company</span>
             {selected.length > 0 && (
               <button
                 type="button"

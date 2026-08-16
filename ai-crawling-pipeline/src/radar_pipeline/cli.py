@@ -116,6 +116,35 @@ def cmd_summarize(store, config, metrics: MetricsCollector) -> None:
     )
 
 
+def cmd_scrape_stocks(config, metrics: MetricsCollector) -> None:
+    from radar_pipeline.stocks import scrape_all_stocks, upload_stocks_json
+
+    run = metrics.start("scrape-stocks")
+    print("Scraping European stock prices...")
+    quotes = asyncio.run(scrape_all_stocks())
+    for q in quotes:
+        print(f"  {q.company}: {q.price} {q.currency} ({q.change_percent:+.2f}%)")
+
+    s3_settings = config.fetch.s3 if config.fetch else None
+    bucket = os.environ.get("RADAR_STOCKS_S3_BUCKET") or (s3_settings.bucket if s3_settings else "")
+    if not bucket:
+        print("No S3 bucket configured (fetch.s3.bucket or RADAR_STOCKS_S3_BUCKET); not uploading.")
+        run.finish(scraped=len(quotes), uploaded=False)
+        return
+
+    import boto3
+
+    kwargs: dict = {}
+    if s3_settings and s3_settings.region_name:
+        kwargs["region_name"] = s3_settings.region_name
+    if s3_settings and s3_settings.endpoint_url:
+        kwargs["endpoint_url"] = s3_settings.endpoint_url
+    s3_client = boto3.client("s3", **kwargs)
+    upload_stocks_json(s3_client, bucket, "stocks/latest.json", quotes)
+    run.finish(scraped=len(quotes), uploaded=True)
+    print(f"Done: {len(quotes)} quote(s) scraped, uploaded to s3://{bucket}/stocks/latest.json")
+
+
 def cmd_retry_failed(store, config, metrics: MetricsCollector) -> None:
     from radar_pipeline.db import retry_failed_articles
 
@@ -180,7 +209,7 @@ def cmd_validate_feeds(config, metrics: MetricsCollector) -> None:
         results = []
         async with httpx.AsyncClient(timeout=30.0) as client:
             for s in sources:
-                url = _feed_url(s, "normal", config.collect.days_back, config.collect.backfill_days, config.collect.hours_back)
+                url = _feed_url(s)
                 if s["feed_type"] == "linkedin_company":
                     # httpx probing is meaningless against a browser-rendered
                     # LinkedIn page; use --collect to actually validate these.
@@ -221,6 +250,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fetch", action="store_true", help="Crawl articles that have a URL")
     p.add_argument("--dedup", action="store_true", help="Run dedup on pending articles")
     p.add_argument("--summarize", action="store_true", help="Summarize pending articles via LLM")
+    p.add_argument(
+        "--scrape-stocks", action="store_true",
+        help="Scrape European stock prices (companies Twelve Data's plan can't "
+        "reach) and upload the snapshot to S3 for the frontend's ticker",
+    )
     p.add_argument(
         "--retry-failed", action="store_true",
         help="Reset articles whose summarize call failed back to pending, so the "
@@ -276,7 +310,7 @@ def main() -> None:
     stage_flags = [
         args.collect, args.classify, args.fetch,
         args.dedup, args.retry_failed, args.summarize, args.status,
-        args.validate_feeds, args.sources_action is not None,
+        args.validate_feeds, args.scrape_stocks, args.sources_action is not None,
     ]
     run_default = not any(stage_flags)
 
@@ -328,6 +362,9 @@ def main() -> None:
 
         if args.summarize:
             cmd_summarize(store, config, metrics)
+
+        if args.scrape_stocks:
+            cmd_scrape_stocks(config, metrics)
 
         if args.status:
             cmd_status(store, config, metrics)

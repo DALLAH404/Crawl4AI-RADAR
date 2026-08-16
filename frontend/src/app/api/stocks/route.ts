@@ -10,6 +10,14 @@ const API_KEY = process.env.TWELVE_DATA_API_KEY;
 // one batch of API credits per interval, not N.
 const REVALIDATE_SECONDS = 60 * 60;
 
+// Twelve Data's free plan can't reach European exchanges (see
+// lib/stockTickers.ts) — those companies are scraped separately on the same
+// 3-hour schedule as the news pipeline (ai-crawling-pipeline/src/radar_pipeline/stocks.py)
+// and dropped as a small public JSON snapshot in S3, which this just fetches
+// directly. No AWS credentials needed here — see DEPLOYMENT.md for the
+// scoped bucket-policy addendum that makes just this one object public.
+const EU_STOCKS_URL = process.env.EU_STOCKS_S3_URL;
+
 export interface StockQuote {
   company: string;
   symbol: string;
@@ -41,10 +49,10 @@ function normalizeQuotes(data: unknown): { requestedSymbol: string; quote: Recor
   return [];
 }
 
-export async function GET() {
+async function fetchTwelveDataStocks(): Promise<StockQuote[]> {
   if (!API_KEY) {
-    console.error("TWELVE_DATA_API_KEY is not set — /api/stocks returning no items");
-    return Response.json({ items: [] satisfies StockQuote[] });
+    console.error("TWELVE_DATA_API_KEY is not set — skipping US-listed stocks");
+    return [];
   }
 
   const symbolToCompany = new Map(
@@ -60,10 +68,10 @@ export async function GET() {
     data = await res.json();
   } catch (error) {
     console.error("Twelve Data request failed:", error);
-    return Response.json({ items: [] satisfies StockQuote[] });
+    return [];
   }
 
-  const items: StockQuote[] = normalizeQuotes(data).flatMap(({ requestedSymbol, quote }) => {
+  return normalizeQuotes(data).flatMap(({ requestedSymbol, quote }) => {
     const company = symbolToCompany.get(requestedSymbol);
     const price = Number(quote.close);
     const changePercent = Number(quote.percent_change);
@@ -82,6 +90,47 @@ export async function GET() {
       },
     ];
   });
+}
 
-  return Response.json({ items });
+// Shape written by stocks.py's quotes_to_json — {company, price,
+// change_percent, currency, scraped_at}. No ticker symbol exists for these
+// (they're not fetched by symbol), so `symbol` just mirrors `company`.
+async function fetchEuStocks(): Promise<StockQuote[]> {
+  if (!EU_STOCKS_URL) return [];
+
+  let data: unknown;
+  try {
+    const res = await fetch(EU_STOCKS_URL, { next: { revalidate: REVALIDATE_SECONDS } });
+    if (!res.ok) return [];
+    data = await res.json();
+  } catch (error) {
+    console.error("EU stocks snapshot fetch failed:", error);
+    return [];
+  }
+
+  if (!data || typeof data !== "object" || !Array.isArray((data as { items?: unknown }).items)) {
+    return [];
+  }
+
+  return (data as { items: unknown[] }).items.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const { company, price, change_percent, currency } = item as Record<string, unknown>;
+    if (typeof company !== "string" || typeof price !== "number" || typeof change_percent !== "number") {
+      return [];
+    }
+    return [
+      {
+        company,
+        symbol: company,
+        price,
+        changePercent: change_percent,
+        currency: typeof currency === "string" ? currency : "",
+      },
+    ];
+  });
+}
+
+export async function GET() {
+  const [usItems, euItems] = await Promise.all([fetchTwelveDataStocks(), fetchEuStocks()]);
+  return Response.json({ items: [...usItems, ...euItems] satisfies StockQuote[] });
 }

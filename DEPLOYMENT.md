@@ -213,24 +213,27 @@ or substitute on the fly with `sed` as shown below.
 
 ### 1. Store the summarize LLM API key
 
-`configs/radar.yaml`'s `summarize.llm` points at an OpenAI-compatible endpoint and
-reads its key from `OPENAI_API_KEY` (`summarize.llm.api_key_env`). This goes in SSM
-Parameter Store as a `SecureString` — never as a plaintext environment variable in
-the task definition.
+`configs/radar.yaml`'s `summarize.llm` points at an OpenCode Zen endpoint
+(`https://opencode.ai/zen/go/v1`) and reads its key from `OPENAI_API_KEY`
+(`summarize.llm.api_key_env`). This goes in SSM Parameter Store as a
+`SecureString` — never as a plaintext environment variable in the task
+definition. The key must be one issued by **OpenCode Zen's own dashboard**
+(sign in at opencode.ai/zen → Create API Key) — the env var is just named
+`OPENAI_API_KEY` because that's the default the OpenAI-compatible client library
+looks for, not because it needs to be a key from OpenAI itself; a key from a
+different provider (OpenAI directly, BazaarLink, etc.) will authenticate against
+a different service and fail here with a 401, even though it's "valid" elsewhere.
 
 **Console**: Systems Manager → **Parameter Store** → **Create parameter**.
 - **Name**: `/radar-scraper/openai-api-key`
 - **Tier**: Standard.
 - **Type**: **SecureString** (leave the default AWS-managed KMS key unless your org
   requires a customer-managed one).
-- **Value**: your actual API key for whatever endpoint `summarize.llm.base_url`
-  points at (the sample config uses an OpenCode Zen endpoint, not literally OpenAI —
-  the env var is just named `OPENAI_API_KEY` because that's the default the
-  OpenAI-compatible client library looks for).
+- **Value**: your actual OpenCode Zen API key.
 - **Create parameter**.
 
-**Confirm it worked**: the parameter list shows `/radar-scraper/openai-api-key` with
-**Type: SecureString**.
+**Confirm it worked**: the parameter list shows `/radar-scraper/openai-api-key`
+with **Type: SecureString**.
 
 **CLI equivalent**:
 
@@ -238,9 +241,14 @@ the task definition.
 aws ssm put-parameter \
   --name /radar-scraper/openai-api-key \
   --type SecureString \
-  --value "<your-api-key>" \
+  --value "<your-opencode-zen-api-key>" \
   --region <REGION>
 ```
+
+**Want to use BazaarLink instead?** See the "Addendum — Switching the summarize
+LLM from OpenCode Zen to BazaarLink" section near the end of this file — it's a
+provider switch, not a key rotation, and needs an IAM policy update too, not just
+a new SSM parameter.
 
 If dedup's Layer 3/4 (Gemini embedding + LLM judge) ever gets re-enabled — it's
 currently dead code, see `src/radar_pipeline/README.md` — repeat this for
@@ -1050,4 +1058,299 @@ an empty list.
 
 ---
 
-*(Phase 7 — frontend — will add its own section here once it's built.)*
+## Addendum — European stock prices (scraper + public S3 snapshot + frontend)
+
+The frontend's stock ticker uses Twelve Data's API for US-listed companies, but
+their free plan hard-blocks every European exchange (Euronext Paris, XETR,
+Stockholm — confirmed via live calls, not assumed; see
+`frontend/src/lib/stockTickers.ts`). `src/radar_pipeline/stocks.py` scrapes those
+four companies (Valeo, Continental, Schaeffler, SKF) from finanzen.net instead —
+checked against finanzen.net's own `robots.txt` first, which doesn't disallow the
+`/aktien/<slug>-aktie` pages used here — and writes one small JSON snapshot the
+frontend fetches directly over plain HTTPS, no AWS credentials involved on that
+side at all.
+
+This intentionally uses a **separate, dedicated bucket** from `radar-scraper-raw`
+rather than adding a public exception to it — that bucket's whole design is
+"nothing in here is ever public" (raw scraped article content isn't meant for
+public redistribution), and a scoped policy is easy to get right once but risky to
+maintain correctly forever mixed in with that invariant. One small bucket whose
+only job is serving this one public file is simpler to reason about and audit.
+
+### 1. Create the public snapshot bucket
+
+**Console**: S3 → **Create bucket**.
+- **Bucket name**: `radar-scraper-public` (must be globally unique — append your
+  account ID or a suffix if it's taken).
+- **Region**: same region as everything else in this guide.
+- **Block Public Access settings**: **uncheck** "Block public access to buckets
+  and objects granted through new public bucket or access point policies" and
+  "Block public and cross-account access to buckets and access points granted
+  through any public bucket or access point policies" — this bucket's only
+  content is meant to be public. Leave the other two ACL-related boxes checked
+  (nothing here uses ACLs).
+- **Create bucket**.
+
+**CLI equivalent**:
+
+```bash
+aws s3api create-bucket --bucket radar-scraper-public --region <REGION> \
+  --create-bucket-configuration LocationConstraint=<REGION>
+# (omit --create-bucket-configuration if <REGION> is us-east-1)
+aws s3api put-public-access-block --bucket radar-scraper-public --region <REGION> \
+  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false
+```
+
+### 2. Add a bucket policy scoped to just the one object
+
+**Console**: S3 → `radar-scraper-public` → **Permissions** tab → **Bucket
+policy** → **Edit**:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PublicReadStocksSnapshot",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::radar-scraper-public/stocks/latest.json"
+    }
+  ]
+}
+```
+
+Note the `Resource` is the exact object key, not `radar-scraper-public/*` — nothing
+else in this bucket becomes public just because something might get uploaded here
+later.
+
+**CLI equivalent**:
+
+```bash
+cat > /tmp/stocks-bucket-policy.json << 'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PublicReadStocksSnapshot",
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::radar-scraper-public/stocks/latest.json"
+    }
+  ]
+}
+EOF
+aws s3api put-bucket-policy --bucket radar-scraper-public --region <REGION> \
+  --policy file:///tmp/stocks-bucket-policy.json
+```
+
+**Confirm it worked**: `aws s3api get-bucket-policy --bucket radar-scraper-public
+--region <REGION>` returns the statement above (this succeeds even before the
+object itself exists yet — the policy applies to a key path, not an existing file).
+
+### 3. No task-role IAM changes needed
+
+`iam/task-role-policy.json`'s `RadarFetchArchiveBucket` statement already grants
+`s3:PutObject` on `<bucket>/*` — a wildcard on *any* key in that bucket. Since
+`--scrape-stocks` will point at the *new* `radar-scraper-public` bucket via its own
+env var (step 5), not `<FETCH_BUCKET_NAME>`, that existing statement doesn't cover
+it. Add a second statement rather than widening the first one to cover both
+buckets:
+
+```bash
+cd ai-crawling-pipeline
+python3 - << 'EOF'
+import json
+policy = json.load(open("iam/task-role-policy.json"))
+policy["Statement"].append({
+    "Sid": "RadarStocksPublicBucket",
+    "Effect": "Allow",
+    "Action": "s3:PutObject",
+    "Resource": "arn:aws:s3:::radar-scraper-public/stocks/latest.json",
+})
+json.dump(policy, open("iam/task-role-policy.json", "w"), indent=2)
+EOF
+
+aws iam put-role-policy --role-name radar-scraper-task-role \
+  --policy-name radar-scraper-task-policy \
+  --policy-document file://iam/task-role-policy.json \
+  --region <REGION>
+```
+
+**Confirm it worked**: `aws iam get-role-policy --role-name radar-scraper-task-role
+--policy-name radar-scraper-task-policy --query
+'PolicyDocument.Statement[?Sid==`RadarStocksPublicBucket`]'` returns the new
+statement.
+
+### 4. Rebuild and push the scraper image
+
+`src/radar_pipeline/stocks.py` and `cli.py`'s new `--scrape-stocks` flag are both
+new source files, baked in at build time same as every previous code change:
+
+```bash
+cd ai-crawling-pipeline
+AWS_ACCOUNT_ID=<your-account-id> AWS_REGION=<your-region> ./push_to_ecr.sh
+```
+
+### 5. Create a second EventBridge schedule for --scrape-stocks
+
+Deliberately a **separate** schedule from `radar-scraper-every-3-hours`, not an
+added flag on that one — the existing schedule runs the task with *no* command
+override at all, relying on `cli.py`'s default-stages fallback
+(`--collect --fetch --dedup --summarize` when no flag is passed). Adding
+`--scrape-stocks` as a container override on that same schedule would silently
+*replace* that fallback — passing any flag switches the default off — and stop
+your news pipeline from running unless you remembered to also spell out all four
+of the others every time. Two simple schedules are safer than one that's easy to
+break on a future edit.
+
+**Console**: EventBridge → **Scheduler** → **Create schedule**.
+
+1. **Schedule name**: `radar-scraper-stocks-every-3-hours`.
+2. **Schedule pattern**: same choice as Phase 5 — `rate(3 hours)` or
+   `cron(0 */3 * * ? *)`.
+3. **Flexible time window**: **Off**.
+4. **Target**: **Templated targets** → **ECS Task**.
+   - **Cluster**: `radar-scraper` (same as Phase 5).
+   - **Task definition**: `radar-scraper` (same task definition — same image, same
+     role, just a different command for this invocation).
+   - **Launch type**: **FARGATE**. **Platform version**: `LATEST`.
+   - **Task count**: `1`.
+   - **Subnets** / **Security group** / **Auto-assign public IP**: same as Phase 5.
+   - **Container overrides** → your container name → **Command override**:
+     `["--scrape-stocks"]`
+5. **Environment variable override** (same container overrides section): add
+   `RADAR_STOCKS_S3_BUCKET` = `radar-scraper-public`.
+6. **Permissions**: reuse `radar-scraper-scheduler-role` from Phase 5.
+7. **Create schedule**.
+
+**Confirm it worked**: EventBridge → Scheduler → `radar-scraper-stocks-every-3-hours`
+shows **State: Enabled**. To check the result without waiting 3 hours, select it →
+**Actions** → **Invoke** (or trigger the underlying ECS task manually the same way
+Phase 5 covers), then check CloudWatch Logs for that task run — it should print
+each company's scraped price and end with `Done: 4 quote(s) scraped, uploaded to
+s3://radar-scraper-public/stocks/latest.json`.
+
+### 6. Point the frontend at the public snapshot
+
+Set in `frontend/.env.local` (or Amplify's environment variables once deployed):
+
+```
+EU_STOCKS_S3_URL=https://radar-scraper-public.s3.<region>.amazonaws.com/stocks/latest.json
+```
+
+**Confirm it worked**:
+
+```bash
+curl https://radar-scraper-public.s3.<region>.amazonaws.com/stocks/latest.json
+```
+
+should return the 4-company JSON with no AWS auth needed — a plain public GET.
+Then `curl http://localhost:3000/api/stocks` (dev server running) should list all 9
+companies: the 5 US-listed ones from Twelve Data plus these 4.
+
+---
+
+## Addendum — Switching the summarize LLM from OpenCode Zen to BazaarLink
+
+`configs/radar.yaml`'s `summarize.llm` (and the dead-code `dedup.judge_llm`) used to
+point at an OpenCode Zen endpoint with the key read from an env var confusingly
+named `OPENAI_API_KEY`. If you set that up from an earlier version of this guide
+and are now seeing `--summarize` fail every article with `AuthenticationError:
+... Invalid API key` even though the key looks right — it likely is a real,
+working key, just issued by the wrong provider for the endpoint being called. A
+BazaarLink key (`sk-bl-...`, from bazaarlink.ai → `/keys` → Create Key) will never
+authenticate against OpenCode Zen's endpoint, and vice versa — "valid" only means
+valid *somewhere*, not valid for whatever `base_url` is actually configured.
+
+The code and config in this repo now point at BazaarLink
+(`https://api.bazaarlink.ai/v1`, model `deepseek/deepseek-v4-flash`) by default —
+this addendum is the AWS-side migration for an environment that already has the
+old setup deployed. Three things to redo, in order:
+
+### 1. Create the new SSM parameter
+
+```bash
+aws ssm put-parameter \
+  --name /radar-scraper/bazaarlink-api-key \
+  --type SecureString \
+  --value "<your-bazaarlink-api-key>" \
+  --region <REGION>
+```
+
+**Console equivalent**: Systems Manager → **Parameter Store** → **Create
+parameter** → **Name**: `/radar-scraper/bazaarlink-api-key` → **Type**:
+SecureString → **Value**: your `sk-bl-...` key → **Create parameter**.
+
+### 2. Re-apply the execution role's IAM policy
+
+`iam/task-execution-policy.json` is already updated to reference the new
+parameter's ARN instead of the old `openai-api-key` one — but the *deployed* role
+still has the old inline policy until you re-apply it. Skipping this step means
+the task gets an access-denied trying to read the new parameter, a different
+error than the one you started with:
+
+`iam/task-execution-policy.json` still has generic `<REGION>`/`<ACCOUNT_ID>`
+placeholders in the repo — fill those in with your real values first (same as the
+`sed` step at the top of Phase 3) before either option below:
+
+```bash
+cd ai-crawling-pipeline
+sed -i "s/<ACCOUNT_ID>/<your-account-id>/g; s/<REGION>/<your-region>/g" iam/task-execution-policy.json
+```
+
+**CLI**:
+
+```bash
+aws iam put-role-policy --role-name radar-scraper-execution-role \
+  --policy-name radar-scraper-execution-policy \
+  --policy-document file://iam/task-execution-policy.json \
+  --region <REGION>
+```
+
+**Console equivalent**: IAM → **Roles** → `radar-scraper-execution-role` →
+**Permissions** tab → click into the attached inline policy
+(`radar-scraper-execution-policy`) → **Edit** → **JSON** tab → paste the
+filled-in contents of `iam/task-execution-policy.json` → **Save changes**.
+
+**Confirm it worked**: `aws iam get-role-policy --role-name
+radar-scraper-execution-role --policy-name radar-scraper-execution-policy --query
+'PolicyDocument.Statement[?Sid==`ReadSummarizeLlmApiKey`]'` shows the new
+`bazaarlink-api-key` ARN, not the old `openai-api-key` one.
+
+### 3. Rebuild, push, and re-register
+
+The config change (`configs/radar.yaml`) is baked into the image, and
+`task-definition.json`'s `secrets` mapping changed too (`BAZAARLINK_API_KEY` now,
+not `OPENAI_API_KEY`) — both need picking up:
+
+```bash
+cd ai-crawling-pipeline
+AWS_ACCOUNT_ID=<your-account-id> AWS_REGION=<your-region> ./push_to_ecr.sh
+sed -i "s/<ACCOUNT_ID>/<your-account-id>/g; s/<REGION>/<your-region>/g" task-definition.json
+aws ecs register-task-definition --cli-input-json file://task-definition.json --region <REGION>
+```
+
+Same cluster, same scheduled rule — nothing to change on the EventBridge side,
+it always runs whatever the task definition's latest revision points at.
+
+### 4. Confirm it worked end to end, then clean up the old parameter
+
+```bash
+python -m radar_pipeline.cli --retry-failed --config configs/radar.yaml
+python -m radar_pipeline.cli --summarize --config configs/radar.yaml
+```
+
+The log should show real `summarized`/`irrelevant` counts instead of every article
+failing with `AuthenticationError`. Once confirmed, delete the old parameter:
+
+```bash
+aws ssm delete-parameter --name /radar-scraper/openai-api-key --region <REGION>
+```
+
+---
+
+*(Phase 7 — frontend deployment to Amplify Hosting — will add its own section here
+once it's built.)*
