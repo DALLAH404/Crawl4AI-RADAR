@@ -24,21 +24,38 @@ GET /articles
 | `company` | One or more source `tag` values, comma-separated (e.g. `Bosch,Valeo`) — switches from the latest-overall feed to a per-company one | none (latest-overall) |
 | `from` | Start of the date range (`YYYY-MM-DD` or full ISO timestamp), only used with `company` | none |
 | `to` | End of the date range, inclusive, only used with `company` | none |
+| `kind` | `news` or `social` — the News/Social filter. Combinable with `company` | none (both kinds) |
 
-Two distinct query patterns, matching the DynamoDB schema in
-`ai-crawling-pipeline/src/radar_pipeline/README.md`'s "Database layer":
+Three query patterns depending on which of `company`/`kind` are present, matching
+the DynamoDB schema in `ai-crawling-pipeline/src/radar_pipeline/README.md`'s
+"Database layer":
 
-- **No `company`** — latest N articles overall, via `LatestIndex`. This is the
-  homepage feed — chronological, not grouped by company (see the design
-  discussion that motivated the schema).
-- **`company` present** — one or more companies' articles within `from`/`to`,
-  via `CompanyTimeIndex`. More than one company fans out into one `Query` per
-  company (DynamoDB can't do an "IN" query against a partition key) and merges
-  the results by `published_at`, deduping any article linked to more than one
-  of the selected companies. Pagination in this case is *approximate*, not
-  exact — each page re-queries every selected company and re-merges, carrying a
-  cursor per company rather than one global one. Fine at this project's scale;
-  not something to build a heavier merged read-model for yet.
+- **Neither `company` nor `kind`** — latest N articles overall, via `LatestIndex`.
+  This is the homepage feed — chronological, not grouped by company or kind (see
+  the design discussion that motivated the schema).
+- **`kind`, no `company`** — the un-companied News or Social feed, via `KindIndex`.
+  Gets its own index (rather than filtering `LatestIndex`) because it can span the
+  whole table, same reasoning as `LatestIndex` itself.
+- **`company` present (with or without `kind`)** — one or more companies' articles
+  within `from`/`to`, via `CompanyTimeIndex`. More than one company fans out into
+  one `Query` per company (DynamoDB can't do an "IN" query against a partition key)
+  and merges the results by `published_at`, deduping any article linked to more
+  than one of the selected companies. When `kind` is also given, each company's
+  Query is filtered by `content_kind` — a `FilterExpression`, not a second
+  dedicated index, since one company's results are already narrow. That filter
+  interacts with DynamoDB's `Limit` in a way worth knowing about: `Limit` applies
+  to items *evaluated*, before the filter runs, so a naive single query can come
+  back with fewer than `limit` matches even when more exist — `_query_one_company`
+  loops on the pagination cursor until it actually collects `limit` matches or runs
+  out of that company's results, rather than under-returning. Pagination for the
+  no-`company`, `kind`-only case (like the plain latest-overall case) is exact, not
+  approximate — only the multi-company fan-out case has the "carries a cursor per
+  company" approximation described next.
+
+  Pagination across multiple companies is *approximate*, not exact — each page
+  re-queries every selected company and re-merges, carrying a cursor per company
+  rather than one global one. Fine at this project's scale; not something to build
+  a heavier merged read-model for yet.
 
 ### Response
 
@@ -53,6 +70,7 @@ Two distinct query patterns, matching the DynamoDB schema in
       "summary": "…",
       "competitor_analysis": "…",
       "category": "auto",
+      "content_kind": "news",
       "event_type": "Lancamento",
       "alert_level": "Alto",
       "summary_status": "ai_generated",
@@ -78,10 +96,10 @@ so the frontend never needs to guard against a missing key.
 ### Errors
 
 `400` — bad `limit` (not a positive integer, though it's silently clamped to
-100 rather than erroring if it's just *too high*) or an empty `company` param.
-`405` — anything other than `GET`/`OPTIONS`. `500` — anything unexpected talking
-to DynamoDB; the actual exception is logged (CloudWatch), never returned to the
-caller.
+100 rather than erroring if it's just *too high*), an empty `company` param, or a
+`kind` value other than `news`/`social`. `405` — anything other than
+`GET`/`OPTIONS`. `500` — anything unexpected talking to DynamoDB; the actual
+exception is logged (CloudWatch), never returned to the caller.
 
 ## IAM
 

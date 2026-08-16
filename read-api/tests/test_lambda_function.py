@@ -39,6 +39,8 @@ def table():
                 {"AttributeName": "gsi1sk", "AttributeType": "S"},
                 {"AttributeName": "gsi2pk", "AttributeType": "S"},
                 {"AttributeName": "gsi2sk", "AttributeType": "S"},
+                {"AttributeName": "gsi5pk", "AttributeType": "S"},
+                {"AttributeName": "gsi5sk", "AttributeType": "S"},
             ],
             KeySchema=[
                 {"AttributeName": "pk", "KeyType": "HASH"},
@@ -61,12 +63,21 @@ def table():
                     ],
                     "Projection": {"ProjectionType": "ALL"},
                 },
+                {
+                    "IndexName": "KindIndex",
+                    "KeySchema": [
+                        {"AttributeName": "gsi5pk", "KeyType": "HASH"},
+                        {"AttributeName": "gsi5sk", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
             ],
         )
         yield boto3.resource("dynamodb", region_name="us-east-1").Table("radar-articles")
 
 
 def _put_base_item(table, *, article_hash, published_at, title="A title", **extra):
+    content_kind = extra.pop("content_kind", "news")
     item = {
         "pk": f"ARTICLE#{article_hash}",
         "sk": "METADATA",
@@ -75,12 +86,15 @@ def _put_base_item(table, *, article_hash, published_at, title="A title", **extr
         "link": f"https://example.com/{article_hash}",
         "published_at": published_at,
         "category": "auto",
+        "content_kind": content_kind,
         "summary": "A summary.",
         "summary_status": "ai_generated",
         "source_name": "Test Source",
         "companies": extra.pop("companies", ["Bosch"]),
         "gsi2pk": "ARTICLE",
         "gsi2sk": f"{published_at}#{article_hash}",
+        "gsi5pk": f"KIND#{content_kind}",
+        "gsi5sk": f"{published_at}#{article_hash}",
         "dedup_reason": "internal-only-should-never-leak",
         "raw_link": "https://news.google.com/internal-only-should-never-leak",
         **extra,
@@ -133,8 +147,8 @@ class TestLatestArticles:
         assert "raw_link" not in article
         assert set(article) == {
             "article_hash", "title", "link", "image_url", "summary",
-            "competitor_analysis", "category", "event_type", "alert_level",
-            "summary_status", "published_at", "companies", "source_name",
+            "competitor_analysis", "category", "content_kind", "event_type",
+            "alert_level", "summary_status", "published_at", "companies", "source_name",
         }
 
     def test_pagination_cursor_advances(self, table):
@@ -186,6 +200,73 @@ class TestCompanyArticles:
         article = body["items"][0]
         assert article["companies"] == ["Bosch"]
         assert article["summary"] == ""  # not denormalized onto company-link items
+
+
+class TestKindFiltering:
+    def test_kind_alone_no_company(self, table):
+        _put_base_item(table, article_hash="news-1", published_at="2026-08-05", content_kind="news")
+        _put_base_item(table, article_hash="social-1", published_at="2026-08-06", content_kind="social")
+
+        news = json.loads(lf.handler(_event({"kind": "news"}), None)["body"])
+        social = json.loads(lf.handler(_event({"kind": "social"}), None)["body"])
+        assert [a["article_hash"] for a in news["items"]] == ["news-1"]
+        assert [a["article_hash"] for a in social["items"]] == ["social-1"]
+
+    def test_no_kind_no_company_is_unfiltered_latest(self, table):
+        _put_base_item(table, article_hash="news-1", published_at="2026-08-05", content_kind="news")
+        _put_base_item(table, article_hash="social-1", published_at="2026-08-06", content_kind="social")
+
+        body = json.loads(lf.handler(_event({}), None)["body"])
+        assert {a["article_hash"] for a in body["items"]} == {"news-1", "social-1"}
+
+    def test_company_and_kind_combined(self, table):
+        _put_company_item(table, article_hash="bosch-news", company="Bosch", published_at="2026-08-05", content_kind="news")
+        _put_company_item(table, article_hash="bosch-social", company="Bosch", published_at="2026-08-06", content_kind="social")
+
+        news_only = json.loads(
+            lf.handler(_event({"company": "Bosch", "from": "2026-08-01", "kind": "news"}), None)["body"]
+        )
+        social_only = json.loads(
+            lf.handler(_event({"company": "Bosch", "from": "2026-08-01", "kind": "social"}), None)["body"]
+        )
+        both = json.loads(lf.handler(_event({"company": "Bosch", "from": "2026-08-01"}), None)["body"])
+
+        assert [a["article_hash"] for a in news_only["items"]] == ["bosch-news"]
+        assert [a["article_hash"] for a in social_only["items"]] == ["bosch-social"]
+        assert {a["article_hash"] for a in both["items"]} == {"bosch-news", "bosch-social"}
+
+    def test_company_and_kind_honors_limit_past_dynamodb_prefilter_quirk(self, table):
+        # Interleaved news/social for the same company — Limit applies
+        # before the FilterExpression, so a naive single Query for
+        # kind=social with limit=3 could come back with fewer than 3 even
+        # though 5 exist. This is exactly what _query_one_company's loop
+        # in lambda_function.py exists to prevent.
+        for i in range(5):
+            _put_company_item(
+                table, article_hash=f"news-{i}", company="Bosch",
+                published_at=f"2026-08-{10+i}", content_kind="news",
+            )
+            _put_company_item(
+                table, article_hash=f"social-{i}", company="Bosch",
+                published_at=f"2026-08-{10+i}", content_kind="social",
+            )
+
+        body = json.loads(
+            lf.handler(_event({"company": "Bosch", "from": "2026-08-01", "kind": "social", "limit": "3"}), None)["body"]
+        )
+        assert len(body["items"]) == 3
+        assert all(a["article_hash"].startswith("social-") for a in body["items"])
+
+    def test_multi_company_with_kind(self, table):
+        _put_company_item(table, article_hash="bosch-social", company="Bosch", published_at="2026-08-05", content_kind="social")
+        _put_company_item(table, article_hash="valeo-news", company="Valeo", published_at="2026-08-06", content_kind="news")
+
+        body = json.loads(lf.handler(_event({"company": "Bosch,Valeo", "kind": "social"}), None)["body"])
+        assert [a["article_hash"] for a in body["items"]] == ["bosch-social"]
+
+    def test_invalid_kind_rejected(self, table):
+        resp = lf.handler(_event({"kind": "not-a-real-kind"}), None)
+        assert resp["statusCode"] == 400
 
 
 class TestHandlerValidation:

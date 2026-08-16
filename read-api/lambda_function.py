@@ -7,19 +7,22 @@ layer.
 
 Query patterns (see ai-crawling-pipeline/src/radar_pipeline/README.md's
 "Database layer — db.py" for the full schema):
-  - latest N articles overall:        LatestIndex       (gsi2pk="ARTICLE")
-  - one or more companies + a range:  CompanyTimeIndex  (gsi1pk="COMPANY#<tag>")
+  - latest N articles overall:            LatestIndex       (gsi2pk="ARTICLE")
+  - one kind, no company:                 KindIndex         (gsi5pk="KIND#<kind>")
+  - one or more companies, any/one kind:  CompanyTimeIndex  (gsi1pk="COMPANY#<tag>",
+                                           optionally filtered by content_kind)
 
 Deliberately does not import radar_pipeline.db — this Lambda is its own
-independently-deployable unit, and duplicating the two query patterns here
-(each ~15 lines, stable, already covered by radar_pipeline's own tests) is
-a smaller ongoing cost than coupling this deployment's packaging to the
-scraper's source tree. If the table schema in db.py ever changes, this
-file needs the matching update by hand.
+independently-deployable unit, and duplicating these query patterns here
+(stable, already covered by radar_pipeline's own tests) is a smaller
+ongoing cost than coupling this deployment's packaging to the scraper's
+source tree. If the table schema in db.py ever changes, this file needs
+the matching update by hand.
 
 Route:
     GET /articles?limit=20&cursor=...
-    GET /articles?company=Bosch,Valeo&from=2026-08-01&to=2026-08-31&limit=20&cursor=...
+    GET /articles?kind=news&limit=20&cursor=...
+    GET /articles?company=Bosch,Valeo&from=2026-08-01&to=2026-08-31&kind=social&limit=20&cursor=...
 
 Response shape:
     {"items": [ {...article...}, ... ], "next_cursor": "<opaque>" | null}
@@ -34,11 +37,12 @@ from decimal import Decimal
 from typing import Any
 
 import boto3
-from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.conditions import Attr, Key
 
 TABLE_NAME = os.environ.get("RADAR_TABLE_NAME", "radar-articles")
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 100
+VALID_KINDS = {"news", "social"}
 
 _table = None
 
@@ -98,6 +102,7 @@ def _public_article(item: dict) -> dict:
         "summary": item.get("summary", ""),
         "competitor_analysis": item.get("competitor_analysis", ""),
         "category": item.get("category", ""),
+        "content_kind": item.get("content_kind", "news"),
         "event_type": item.get("event_type", ""),
         "alert_level": item.get("alert_level", ""),
         "summary_status": item.get("summary_status", ""),
@@ -137,9 +142,46 @@ def _latest_articles(limit: int, cursor: str | None) -> dict:
     }
 
 
+def _articles_by_kind(kind: str, limit: int, cursor: str | None) -> dict:
+    """The "one kind, no company" feed — same shape as _latest_articles,
+    scoped to KindIndex's gsi5pk instead of LatestIndex's constant one."""
+    table = _table_resource()
+    kwargs: dict[str, Any] = {
+        "IndexName": "KindIndex",
+        "KeyConditionExpression": Key("gsi5pk").eq(f"KIND#{kind}"),
+        "ScanIndexForward": False,
+        "Limit": limit,
+    }
+    start_key = _decode_cursor(cursor)
+    if start_key:
+        kwargs["ExclusiveStartKey"] = start_key
+    resp = table.query(**kwargs)
+    return {
+        "items": [_public_article(i) for i in resp.get("Items", [])],
+        "next_cursor": _encode_cursor(resp.get("LastEvaluatedKey")),
+    }
+
+
 def _query_one_company(
-    table, company: str, since: str | None, until: str | None, limit: int, start_key: dict | None
+    table,
+    company: str,
+    since: str | None,
+    until: str | None,
+    kind: str | None,
+    limit: int,
+    start_key: dict | None,
 ) -> tuple[list[dict], dict | None]:
+    """One company's items for one page, optionally kind-filtered.
+
+    kind filtering uses a FilterExpression against content_kind
+    (denormalized onto every company-link item), not a dedicated index —
+    same reasoning as db.py's _query_company: a single company's result set
+    is already narrow. DynamoDB's Limit applies before the FilterExpression
+    runs, so a single Query can come back with fewer than `limit` matches
+    even though more exist — this loops on LastEvaluatedKey until either
+    `limit` matches are collected or this company's results (within the
+    date range) are exhausted.
+    """
     key_cond = Key("gsi1pk").eq(f"COMPANY#{company}")
     if since and until:
         # Trailing char sorts after anything the hash suffix on gsi1sk can
@@ -152,20 +194,35 @@ def _query_one_company(
     elif until:
         key_cond &= Key("gsi1sk").lte(f"{until}￿")
 
-    kwargs: dict[str, Any] = {
+    base_kwargs: dict[str, Any] = {
         "IndexName": "CompanyTimeIndex",
         "KeyConditionExpression": key_cond,
         "ScanIndexForward": False,
-        "Limit": limit,
     }
-    if start_key:
-        kwargs["ExclusiveStartKey"] = start_key
-    resp = table.query(**kwargs)
-    return resp.get("Items", []), resp.get("LastEvaluatedKey")
+    if kind:
+        base_kwargs["FilterExpression"] = Attr("content_kind").eq(kind)
+
+    items: list[dict] = []
+    exclusive_start_key = start_key
+    while True:
+        kwargs = dict(base_kwargs, Limit=max(limit - len(items), 1))
+        if exclusive_start_key:
+            kwargs["ExclusiveStartKey"] = exclusive_start_key
+        resp = table.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        exclusive_start_key = resp.get("LastEvaluatedKey")
+        if len(items) >= limit or not exclusive_start_key:
+            break
+    return items[:limit], (exclusive_start_key if len(items) >= limit else None)
 
 
 def _company_articles(
-    companies: list[str], since: str | None, until: str | None, limit: int, cursor: str | None
+    companies: list[str],
+    since: str | None,
+    until: str | None,
+    kind: str | None,
+    limit: int,
+    cursor: str | None,
 ) -> dict:
     """Fans out one Query per company — DynamoDB Query takes one partition
     key value at a time — and merges by published_at, deduping on
@@ -183,7 +240,9 @@ def _company_articles(
     merged: list[dict] = []
 
     for company in companies:
-        items, last_key = _query_one_company(table, company, since, until, limit, prev_keys.get(company))
+        items, last_key = _query_one_company(
+            table, company, since, until, kind, limit, prev_keys.get(company)
+        )
         if last_key:
             next_keys[company] = last_key
         for item in items:
@@ -221,13 +280,21 @@ def handler(event, context):
 
     cursor = params.get("cursor")
     company_param = params.get("company")
+    kind_param = params.get("kind")
+
+    if kind_param and kind_param not in VALID_KINDS:
+        return _response(400, {"error": f"kind must be one of {sorted(VALID_KINDS)}"})
 
     try:
         if company_param:
             companies = [c.strip() for c in company_param.split(",") if c.strip()]
             if not companies:
                 return _response(400, {"error": "company must not be empty"})
-            result = _company_articles(companies, params.get("from"), params.get("to"), limit, cursor)
+            result = _company_articles(
+                companies, params.get("from"), params.get("to"), kind_param, limit, cursor
+            )
+        elif kind_param:
+            result = _articles_by_kind(kind_param, limit, cursor)
         else:
             result = _latest_articles(limit, cursor)
     except Exception as exc:  # noqa: BLE001 — a clean 500, not a stack trace to the client
