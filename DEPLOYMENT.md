@@ -941,13 +941,14 @@ error status means something in steps 1–3 above needs a second look.
 
 ---
 
-## Addendum — News/Social split: a new GSI + a migration + a Lambda code update
+## Addendum — News/Social split: a new GSI, a rebuild, a migration, and a Lambda code update
 
 Added after Phase 6: articles are now tagged `content_kind` (`news` or `social`) so
 the frontend can filter by that dimension, combinable with the company filter. Full
 design in `src/radar_pipeline/README.md`'s "Content kind" section; this is the
-AWS-side setup for it. Three things, in order — all needed, since the table, the
-scraper's data, and the already-deployed read API all predate this field.
+AWS-side setup for it. Four things, in order — all needed, since the table, the
+deployed scraper image, the scraper's existing data, and the already-deployed read
+API all predate this field.
 
 ### 1. Add the KindIndex GSI to the existing table
 
@@ -980,7 +981,25 @@ No IAM changes needed for this step — both the scraper's task role and the rea
 API's role already scope their DynamoDB actions to `table/radar-articles/index/*`
 (a wildcard), which automatically covers any new index.
 
-### 2. Backfill content_kind on existing articles
+### 2. Rebuild and push the scraper image
+
+`configs/radar_sources.yaml` and `src/radar_pipeline/{db.py,models.py,sources/catalog.py,sources/collector.py}`
+all changed — all baked into the image at build time (`Dockerfile`'s `COPY configs
+./configs` and `COPY src ./src`). Without this step, every *new* article the
+scraper collects keeps landing without `content_kind`/`gsi5pk`, same problem as the
+historical data step 3 below fixes — a rebuild is what makes new collect runs tag
+articles correctly going forward, not just the migration script catching up once.
+
+```bash
+cd ai-crawling-pipeline
+AWS_ACCOUNT_ID=<your-account-id> AWS_REGION=<your-region> ./push_to_ecr.sh
+```
+
+Same `:latest` tag, same task definition — the next scheduled or manually-triggered
+run just pulls the new image automatically, no re-registration needed (same as
+every previous image update).
+
+### 3. Backfill content_kind on existing articles
 
 Same idea as the `PendingIndex` scheme migration from earlier: articles collected
 before this field existed have neither `content_kind` nor a `gsi5pk` at all, so
@@ -1001,7 +1020,7 @@ KindIndex --key-condition-expression "gsi5pk = :k" --expression-attribute-values
 '{":k":{"S":"KIND#social"}}' --region <REGION>` should return your LinkedIn
 articles.
 
-### 3. Update the read API Lambda's code
+### 4. Update the read API Lambda's code
 
 `read-api/lambda_function.py` changed (the `kind` query param, `KindIndex`, and the
 company+kind filter). If you already created the Lambda in Phase 6, it's running
@@ -1026,7 +1045,7 @@ curl "https://<api-id>.execute-api.<region>.amazonaws.com/articles?kind=social&l
 curl "https://<api-id>.execute-api.<region>.amazonaws.com/articles?company=Bosch&kind=news"
 ```
 
-Both should return real data (once steps 1–2 above have run) rather than an error or
+Both should return real data (once steps 1–3 above have run) rather than an error or
 an empty list.
 
 ---
