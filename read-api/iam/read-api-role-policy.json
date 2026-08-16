@@ -1,0 +1,14 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RadarArticlesReadOnly",
+      "Effect": "Allow",
+      "Action": "dynamodb:Query",
+      "Resource": [
+        "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/radar-articles",
+        "arn:aws:dynamodb:<REGION>:<ACCOUNT_ID>:table/radar-articles/index/*"
+      ]
+    }
+  ]
+}

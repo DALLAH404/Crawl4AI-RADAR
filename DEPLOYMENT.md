@@ -795,5 +795,150 @@ should show one folder per run, each named like `20260813T090000Z/`, containing 
 
 ---
 
-*(Later phases — read API, frontend — will each add their own section here as
-they're built.)*
+## Phase 6 — Read API
+
+A Lambda (`read-api/lambda_function.py`) behind an API Gateway HTTP API, one
+route, read-only against the same table the scraper writes to. Full design —
+query params, response shape, error codes — is in `read-api/README.md`; this
+section is just the AWS-side setup, in order: IAM role → Lambda → HTTP API →
+wire them together → confirm with `curl`.
+
+### 1. Create the Lambda's IAM role
+
+Fill in the placeholders first, same as every other IAM file in this repo:
+
+```bash
+cd read-api
+sed -i "s/<ACCOUNT_ID>/<your-account-id>/g; s/<REGION>/<your-region>/g" iam/read-api-role-policy.json
+```
+
+**Console**:
+
+1. IAM → **Policies** → **Create policy** → **JSON** tab → paste
+   `iam/read-api-role-policy.json` → name it `radar-scraper-read-api-policy` →
+   **Create policy**.
+2. IAM → **Roles** → **Create role** → **Trusted entity type**: AWS service →
+   **Use case**: **Lambda**.
+3. **Permissions**: attach both `radar-scraper-read-api-policy` (the one you just
+   created) **and** the AWS managed policy `AWSLambdaBasicExecutionRole` (this is
+   what lets the function write its own CloudWatch Logs — every Lambda needs it,
+   no reason to hand-write an equivalent).
+4. **Role name**: `radar-scraper-read-api-role`. **Create role**.
+
+**Confirm it worked**: IAM → Roles → `radar-scraper-read-api-role` shows both
+policies attached and **Trusted entities: lambda.amazonaws.com**.
+
+### 2. Create the Lambda
+
+**Console**: Lambda → **Create function** → **Author from scratch**.
+- **Function name**: `radar-scraper-read-api`.
+- **Runtime**: Python 3.12.
+- **Architecture**: x86_64.
+- **Execution role**: **Use an existing role** → `radar-scraper-read-api-role`.
+- **Create function**.
+- **Code** tab → replace the inline editor's contents with the entire contents of
+  `lambda_function.py` → **Deploy**. (Handler stays at the default
+  `lambda_function.handler` — matches the file/function names exactly, nothing to
+  change.)
+- **Configuration** → **Environment variables** → add `RADAR_TABLE_NAME` =
+  `radar-articles` (or whatever you named it).
+- **Configuration** → **General configuration** → **Edit** → **Timeout**: `10
+  sec` (default 3s is tight for a cold start + Query; this function does
+  trivial work otherwise, so 10s is generous headroom, not a real expectation
+  of it taking that long). **Memory**: leave at 128 MB — plenty.
+
+**Confirm it worked**: **Test** tab → create a test event with:
+```json
+{"requestContext": {"http": {"method": "GET"}}, "queryStringParameters": {"limit": "5"}}
+```
+→ **Test** → should return `"statusCode": 200` and a JSON body with `items`
+(empty array is fine if the table has no data yet, or if you cleared it — that's
+a successful *response*, not a failure).
+
+**CLI equivalent** (needs the code zipped first, since the CLI has no inline-paste
+equivalent to the console):
+
+```bash
+zip function.zip lambda_function.py
+
+aws lambda create-function \
+  --function-name radar-scraper-read-api \
+  --runtime python3.12 \
+  --architectures x86_64 \
+  --role arn:aws:iam::<ACCOUNT_ID>:role/radar-scraper-read-api-role \
+  --handler lambda_function.handler \
+  --zip-file fileb://function.zip \
+  --timeout 10 \
+  --environment "Variables={RADAR_TABLE_NAME=radar-articles}" \
+  --region <REGION>
+```
+
+### 3. Create the HTTP API and wire it to the Lambda
+
+**Console**: API Gateway → **Create API** → **HTTP API** → **Build**.
+- **Integrations**: **Add integration** → **Lambda** → select
+  `radar-scraper-read-api`.
+- **Routes**: method **GET**, path `/articles`, pointed at that integration
+  (the wizard does this for you if you configure the route right after adding
+  the integration).
+- **CORS**: **Configure CORS** — **Access-Control-Allow-Origin**: `*` for now
+  (tighten to the Phase 7 frontend's actual domain once it exists —
+  `Access-Control-Allow-Methods`: `GET`.
+- **Stages**: the wizard creates a `$default` stage with auto-deploy on by
+  default — leave it.
+- **Create**.
+
+**Confirm it worked**: the API's **Routes** tab shows `GET /articles` pointed at
+`radar-scraper-read-api`; note the **Invoke URL** from the API's main page
+(`https://<api-id>.execute-api.<region>.amazonaws.com`) — the curl test below
+needs it.
+
+**CLI equivalent**:
+
+```bash
+LAMBDA_ARN="arn:aws:lambda:<REGION>:<ACCOUNT_ID>:function:radar-scraper-read-api"
+
+API_ID=$(aws apigatewayv2 create-api --name radar-scraper-read-api \
+  --protocol-type HTTP \
+  --cors-configuration AllowOrigins="*",AllowMethods="GET,OPTIONS" \
+  --region <REGION> --query ApiId --output text)
+
+INTEGRATION_ID=$(aws apigatewayv2 create-integration --api-id "$API_ID" \
+  --integration-type AWS_PROXY --integration-uri "$LAMBDA_ARN" \
+  --payload-format-version 2.0 --region <REGION> --query IntegrationId --output text)
+
+aws apigatewayv2 create-route --api-id "$API_ID" --route-key "GET /articles" \
+  --target "integrations/$INTEGRATION_ID" --region <REGION>
+
+aws apigatewayv2 create-stage --api-id "$API_ID" --stage-name '$default' \
+  --auto-deploy --region <REGION>
+
+# API Gateway needs explicit permission to invoke the Lambda — the console
+# wizard does this step for you silently; the CLI path doesn't.
+aws lambda add-permission --function-name radar-scraper-read-api \
+  --statement-id apigateway-invoke --action lambda:InvokeFunction \
+  --principal apigateway.amazonaws.com \
+  --source-arn "arn:aws:execute-api:<REGION>:<ACCOUNT_ID>:${API_ID}/*/*/articles" \
+  --region <REGION>
+
+echo "Invoke URL: https://${API_ID}.execute-api.<REGION>.amazonaws.com"
+```
+
+### 4. Confirm it's returning real data
+
+```bash
+curl "https://<api-id>.execute-api.<region>.amazonaws.com/articles?limit=5"
+
+curl "https://<api-id>.execute-api.<region>.amazonaws.com/articles?company=Bosch&from=2026-08-01"
+```
+
+Expect a `200` with a JSON body containing real articles from your table (titles,
+summaries, the works) — not an empty `items: []`, assuming a scraper run has
+completed by now. An empty list here with a `200` status means the API itself is
+wired correctly but the query genuinely found nothing (check the company tag's
+exact spelling — same case-sensitivity note as the Phase 5 CLI spot-checks); an
+error status means something in steps 1–3 above needs a second look.
+
+---
+
+*(Phase 7 — frontend — will add its own section here once it's built.)*
