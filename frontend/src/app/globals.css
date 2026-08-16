@@ -1,0 +1,165 @@
+@import "tailwindcss";
+
+/* next-themes toggles a literal .dark class on <html>; without this, Tailwind
+   v4's dark: variant defaults to prefers-color-scheme and never reacts to it. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: #ffffff;
+  --foreground: #09090b;
+  --card: #ffffff;
+  --card-foreground: #09090b;
+  --popover: #ffffff;
+  --popover-foreground: #09090b;
+  --primary: #bbf047;
+  --primary-foreground: #1a2e00;
+  --secondary: #f4f4f5;
+  --secondary-foreground: #18181b;
+  --muted: #f4f4f5;
+  --muted-foreground: #71717a;
+  --accent: #e4e4e7;
+  --accent-foreground: #18181b;
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(1 0 0);
+  --border: #d4d4d8;
+  --input: #d4d4d8;
+  --ring: #bbf047;
+  --chart-1: #bbf047;
+  --chart-2: #86c232;
+  --chart-3: #5a9e1a;
+  --chart-4: #4aac5e;
+  --chart-5: #2d8c46;
+  --sidebar: #fafafa;
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: #bbf047;
+  --sidebar-primary-foreground: #1a2e00;
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: #d4d4d8;
+  --sidebar-ring: #bbf047;
+
+  --radius: 0.75rem;
+  --spacing: 0.25rem;
+  --letter-spacing: 0em;
+
+  --font-sans: Alexandria, ui-sans-serif, sans-serif, system-ui;
+  --font-serif: Noto Serif, ui-serif, serif;
+  --font-mono: JetBrains Mono, ui-monospace, monospace;
+  --font-display: Archivo, ui-sans-serif, sans-serif, system-ui;
+
+  /* Composable shadow parts, not yet wired to a Tailwind shadow-* utility —
+     kept for components that need an elevation effect later. */
+  --shadow-color: oklch(0 0 0);
+  --shadow-opacity: 0.1;
+  --shadow-blur: 3px;
+  --shadow-spread: 0px;
+  --shadow-offset-x: 0;
+  --shadow-offset-y: 1px;
+}
+
+.dark {
+  --background: #141414;
+  --foreground: #fafafa;
+  --card: #1e1e1e;
+  --card-foreground: #fafafa;
+  --popover: #242424;
+  --popover-foreground: #fafafa;
+  --primary: #bbf047;
+  --primary-foreground: #1a2e00;
+  --secondary: #27272a;
+  --secondary-foreground: #fafafa;
+  --muted: #27272a;
+  --muted-foreground: #a1a1aa;
+  --accent: #3f3f46;
+  --accent-foreground: #fafafa;
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: #3f3f46;
+  --input: #3f3f46;
+  --ring: #bbf047;
+  --chart-1: #bbf047;
+  --chart-2: #86c232;
+  --chart-3: #5a9e1a;
+  --chart-4: #4aac5e;
+  --chart-5: #2d8c46;
+  --sidebar: #0f0f0f;
+  --sidebar-foreground: #fafafa;
+  --sidebar-primary: #bbf047;
+  --sidebar-primary-foreground: #1a2e00;
+  --sidebar-accent: #3f3f46;
+  --sidebar-accent-foreground: #fafafa;
+  --sidebar-border: #3f3f46;
+  --sidebar-ring: #bbf047;
+}
+
+/* Tailwind v4 keys color tokens under --color-*, radius under --radius-*,
+   fonts under --font-*. The source values above are split light/dark; this
+   block just registers the ones consumed as utilities (bg-card, rounded-lg,
+   font-sans, etc.). */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-sans: var(--font-sans);
+  --font-serif: var(--font-serif);
+  --font-mono: var(--font-mono);
+  --font-display: var(--font-display);
+
+  --tracking-normal: var(--letter-spacing);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+@keyframes ticker-scroll {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
