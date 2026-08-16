@@ -18,6 +18,12 @@ class Source:
     rss_url: str = ""
     query_text: str = ""
     active: bool = True
+    # "news" (RSS/Google News, the general-news feed) or "social" (LinkedIn
+    # today, more platforms later — each new one is just this field in the
+    # YAML catalog, not a code change). Independent of feed_type: feed_type
+    # is the specific fetch mechanism, content_kind is the coarse frontend
+    # routing category that stays a 2-value enum as social platforms grow.
+    content_kind: str = "news"
 
     def to_row(self) -> tuple:
         return (
@@ -67,6 +73,9 @@ class Article:
     # the fetch stage still knows to route linkedin_company rows without a
     # join.
     feed_type: str = ""
+    # Denormalized from the source the same way — "news" or "social", the
+    # frontend's filter dimension alongside company. See db.py's KindIndex.
+    content_kind: str = "news"
     dedup_layer: int | None = None
     dedup_decision: str = ""
     dedup_reason: str = ""

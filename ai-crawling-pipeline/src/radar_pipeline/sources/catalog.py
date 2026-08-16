@@ -35,6 +35,16 @@ def _to_source(item: dict[str, Any]) -> Source:
     if item.get("rss_url"):
         feed_type = "rss_direct"
 
+    # Explicit content_kind wins; otherwise infer from feed_type as a safety
+    # net (a new linkedin_company source added without remembering to tag it
+    # "social" still lands in the right place). Every other feed_type
+    # defaults to "news". New social platforms later are one YAML field, no
+    # code change — this inference only exists for today's one social
+    # feed_type.
+    content_kind = item.get("content_kind") or (
+        "social" if feed_type == "linkedin_company" else "news"
+    )
+
     return Source(
         source_id=item.get("source_id") or _make_slug(item["name"]),
         name=item["name"],
@@ -46,6 +56,7 @@ def _to_source(item: dict[str, Any]) -> Source:
         rss_url=item.get("rss_url", ""),
         query_text=item.get("query_text", ""),
         active=item.get("active", True),
+        content_kind=content_kind,
     )
 
 

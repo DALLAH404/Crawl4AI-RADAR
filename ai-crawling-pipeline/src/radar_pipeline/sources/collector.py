@@ -255,6 +255,7 @@ async def _process_source(
                 source_id=source["source_id"],
                 source_name=source["name"],
                 feed_type=source["feed_type"],
+                content_kind=source["content_kind"],
                 extra=item.get("extra", ""),
             )
 

@@ -396,6 +396,15 @@ to flip `active` at runtime — that mutable state added a table and a migration
 hand-edited anyway. Toggling a source now means editing the YAML; there was nothing else
 in that table worth keeping a database for.
 
+Each source also carries `content_kind` (`"news"` or `"social"`) — the frontend's
+News/Social filter dimension, denormalized onto every article the same way
+`feed_type` is. `catalog._to_source` infers it from `feed_type` when a source
+doesn't set it explicitly (`linkedin_company` → `"social"`, everything else →
+`"news"`), so a new `linkedin_company` source added without remembering to tag it
+still lands in the right place — but LinkedIn sources in `radar_sources.yaml` set it
+explicitly anyway, since a new social platform later is meant to be a one-line YAML
+addition (`content_kind: social`), not a code change to that inference rule.
+
 ### Environment variables
 
 | Variable        | Used by                                  |
@@ -427,7 +436,7 @@ article overwrites the same item instead of creating a duplicate. This replaced 
 
 ### Schema — item types and GSIs
 
-One table, three item types, sharing four GSIs (all `ProjectionType: ALL` — item
+One table, three item types, sharing five GSIs (all `ProjectionType: ALL` — item
 sizes here are small, so the extra storage cost buys skipping an N+1 `GetItem` on
 every read):
 
@@ -436,8 +445,9 @@ every read):
 | **Base article** | `pk=ARTICLE#<hash>` `sk=METADATA` | `LatestIndex`: `gsi2pk=ARTICLE, gsi2sk=<ts>#<hash>` | Every article field; "latest N overall" |
 | | | `DedupIndex`: `gsi3pk=TITLEHASH#<title_hash>, gsi3sk=<ts>#<hash>` | Layer 1 title-hash dedup within a window |
 | | | `PendingIndex`: `gsi4pk=STATUS#<status>, gsi4sk=<ts>#<hash>` (only while `summary_status` is `pending` or `failed`) | `pending_articles()` / `failed_articles()` without scanning the whole table |
+| | | `KindIndex`: `gsi5pk=KIND#<content_kind>, gsi5sk=<ts>#<hash>` (always set — every article has exactly one kind) | `articles_by_kind()` — the News/Social filter's un-companied case |
 | **Raw-link pointer** | `pk=ARTICLE#<hash>` `sk=RAWLINK#<rawhash>` | `DedupIndex`: `gsi3pk=RAWLINK#<rawhash>, gsi3sk=METADATA` | `find_by_raw_link` — the fast pre-resolve dedup check |
-| **Company link** | `pk=ARTICLE#<hash>` `sk=COMPANY#<tag>` | `CompanyTimeIndex`: `gsi1pk=COMPANY#<tag>, gsi1sk=<ts>#<hash>` | Per-company timeline (denormalized display fields, one item per company an article is relevant to) |
+| **Company link** | `pk=ARTICLE#<hash>` `sk=COMPANY#<tag>` | `CompanyTimeIndex`: `gsi1pk=COMPANY#<tag>, gsi1sk=<ts>#<hash>` | Per-company timeline (denormalized display fields, one item per company an article is relevant to; also carries `content_kind` as a plain attribute — see "Filtering by company and kind together" below) |
 
 `Article.companies()` derives the company list from `competitor_tag` (comma-separated
 if a source should fan an article out to more than one company — today every source
@@ -493,6 +503,45 @@ feed by more than one company (`articles_for_companies`) fans out into one
 `published_at`, deduping on `article_hash` in case an article is linked to more than
 one of the selected companies. The single-company case (`articles_for_company`) is
 just one Query.
+
+### Content kind — News vs. Social, and filtering by both company and kind together
+
+`content_kind` (`"news"` or `"social"`) is denormalized onto every source in
+`configs/radar_sources.yaml` and, from there, onto every article and company-link
+item at collect time — same mechanism as `feed_type`. It exists so the frontend can
+filter the feed by News/Social alongside (and combined with) the company filter,
+without that being a fixed set of pages: adding a third platform kind later is a
+schema value, not a schema change.
+
+- **Kind alone, no company** — `articles_by_kind()` queries `KindIndex`
+  (`gsi5pk=KIND#<kind>`) directly. This one *does* get its own GSI (unlike the
+  company+kind combination below) because it can span the whole table — a
+  "no company selected" News or Social feed isn't bounded by anything else, so it
+  needs to be as cheap as `LatestIndex`, not a table `Scan` with a filter.
+- **Company (one or more) + kind** — filters the *existing* `CompanyTimeIndex`
+  Query with a `FilterExpression` on `content_kind` (denormalized onto company-link
+  items for exactly this reason) rather than adding a second dedicated index for the
+  combination. A single company's result set is already narrow — bounded by that
+  company, often further bounded by a date range — so filtering it further doesn't
+  need the same treatment as the unbounded "kind alone" case.
+- **The DynamoDB gotcha this requires handling correctly**: `Limit` applies to items
+  *evaluated*, before a `FilterExpression` runs. A plain `Query(Limit=3,
+  FilterExpression=content_kind=social)` can come back with 0–3 matches depending on
+  how news/social articles happen to be interleaved in that company's timeline, not
+  reliably 3 even when more exist. `_query_company` (`db.py`) and `_query_one_company`
+  (`read-api/lambda_function.py`) both loop on `LastEvaluatedKey` until either the
+  requested count of matches is collected or the company's results are exhausted —
+  covered by a test in both places that's confirmed to fail without the loop, not
+  just pass either way.
+- **Migrating existing data**: articles collected before this field existed have
+  neither `content_kind` nor a `gsi5pk` — `db._as_full_article` backfills the
+  *field* to `"news"` on read (same mechanism as every other backfilled default), but
+  that's wrong for anything actually from a social source, and nothing pre-existing
+  is in `KindIndex` at all until it's rewritten. `scripts/migrate_content_kind.py`
+  scans for base items missing `content_kind`, infers the right value from that
+  article's own `feed_type`, and calls `update_article` — which regenerates the base
+  item *and* every one of its company-link items in one call (see
+  `db._write_article`), so no separate pass over company-link items is needed.
 
 ### Irrelevant articles are invisible to dedup lookups
 
@@ -762,8 +811,9 @@ src/radar_pipeline/
 ├── models.py               Source, Article, CollectionRun, DedupResult, SummarizeResult, ...
 ├── db.py                   DynamoDB layer: connect(), ensure_table() (local/dev),
 │                           put_article, update_article, get_article, find_*,
-│                           pending_articles, latest_articles, articles_for_company(ies),
-│                           mark_article_irrelevant/failed, article_count*
+│                           pending_articles, latest_articles, articles_by_kind,
+│                           articles_for_company(ies), mark_article_irrelevant/failed,
+│                           article_count*
 ├── classify/
 │   ├── rules.py            eh_fora_de_escopo, classify_article (keyword priority chain)
 │   └── keywords.py         FORA_ESCOPO, KW_LANCAMENTO, KW_PECA_AUTOMOTIVA, TEMAS_KW
@@ -842,4 +892,4 @@ uv run python scripts/check_dynamodb_idempotency.py --endpoint-url http://localh
 Tests live in `tests/radar_pipeline/` and run via `uv run pytest
 tests/radar_pipeline/ -q`. The suite covers classify, db (against a moto-mocked
 DynamoDB table — see `conftest.py`), collector (RSS and LinkedIn), fetch/S3 output
-(moto-mocked S3), summarize, and the LinkedIn extraction layer (138 tests).
+(moto-mocked S3), summarize, and the LinkedIn extraction layer (145 tests).

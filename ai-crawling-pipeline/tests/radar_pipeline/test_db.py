@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from boto3.dynamodb.conditions import Key
 
 from radar_pipeline.db import (
+    articles_by_kind,
+    articles_for_company,
+    articles_for_companies,
     failed_articles,
     find_by_article_hash,
     find_by_raw_link,
@@ -15,7 +18,6 @@ from radar_pipeline.db import (
     latest_articles,
     mark_article_failed,
     mark_article_irrelevant,
-    articles_for_company,
     pending_articles,
     put_article,
     retry_failed_articles,
@@ -47,7 +49,7 @@ class TestTable:
     def test_gsis_exist(self, store):
         desc = store.table.meta.client.describe_table(TableName=store.table.table_name)
         gsi_names = {g["IndexName"] for g in desc["Table"].get("GlobalSecondaryIndexes", [])}
-        assert gsi_names == {"CompanyTimeIndex", "LatestIndex", "DedupIndex", "PendingIndex"}
+        assert gsi_names == {"CompanyTimeIndex", "LatestIndex", "DedupIndex", "PendingIndex", "KindIndex"}
 
 
 class TestArticles:
@@ -215,3 +217,103 @@ class TestArticles:
 
         assert [a["article_hash"] for a in articles_for_company(store, "Bosch", "2026-08-01")] == ["shared"]
         assert [a["article_hash"] for a in articles_for_company(store, "Valeo", "2026-08-01")] == ["shared"]
+
+    def test_articles_for_company_no_date_range_returns_everything(self, store):
+        put_article(store, _make_article(
+            article_hash="old", competitor_tag="Bosch",
+            link="https://example.com/old", published_at="2020-01-01",
+        ))
+        put_article(store, _make_article(
+            article_hash="new", competitor_tag="Bosch",
+            link="https://example.com/new", published_at="2026-08-10",
+        ))
+
+        result = articles_for_company(store, "Bosch")
+        assert [a["article_hash"] for a in result] == ["new", "old"]
+
+    def test_articles_for_companies_no_date_range(self, store):
+        put_article(store, _make_article(
+            article_hash="b1", competitor_tag="Bosch",
+            link="https://example.com/b1", published_at="2026-08-05",
+        ))
+        put_article(store, _make_article(
+            article_hash="v1", competitor_tag="Valeo",
+            link="https://example.com/v1", published_at="2026-08-06",
+        ))
+
+        result = articles_for_companies(store, ["Bosch", "Valeo"])
+        assert [a["article_hash"] for a in result] == ["v1", "b1"]
+
+
+class TestContentKind:
+    def test_articles_by_kind_separates_news_and_social(self, store):
+        put_article(store, _make_article(
+            article_hash="news-1", content_kind="news", published_at="2026-08-05",
+            link="https://example.com/news-1",
+        ))
+        put_article(store, _make_article(
+            article_hash="social-1", content_kind="social", published_at="2026-08-06",
+            link="https://example.com/social-1",
+        ))
+
+        news = articles_by_kind(store, "news")
+        social = articles_by_kind(store, "social")
+        assert [a["article_hash"] for a in news] == ["news-1"]
+        assert [a["article_hash"] for a in social] == ["social-1"]
+
+    def test_articles_for_company_kind_filter(self, store):
+        put_article(store, _make_article(
+            article_hash="bosch-news", competitor_tag="Bosch", content_kind="news",
+            link="https://example.com/bosch-news", published_at="2026-08-05",
+        ))
+        put_article(store, _make_article(
+            article_hash="bosch-social", competitor_tag="Bosch", content_kind="social",
+            link="https://example.com/bosch-social", published_at="2026-08-06",
+        ))
+
+        news_only = articles_for_company(store, "Bosch", kind="news")
+        social_only = articles_for_company(store, "Bosch", kind="social")
+        both = articles_for_company(store, "Bosch")
+
+        assert [a["article_hash"] for a in news_only] == ["bosch-news"]
+        assert [a["article_hash"] for a in social_only] == ["bosch-social"]
+        assert {a["article_hash"] for a in both} == {"bosch-news", "bosch-social"}
+
+    def test_articles_for_company_kind_filter_honors_limit_past_dynamodb_prefilter_quirk(self, store):
+        # 5 social articles interleaved with 5 news articles for the same
+        # company. DynamoDB's Limit applies before the FilterExpression, so
+        # a naive single-page Query for kind="social" with Limit=3 could
+        # come back with 0-3 matches depending on interleaving, not
+        # necessarily 3 — this is exactly the bug _query_company's loop
+        # exists to prevent.
+        for i in range(5):
+            put_article(store, _make_article(
+                article_hash=f"news-{i}", competitor_tag="Bosch", content_kind="news",
+                link=f"https://example.com/news-{i}", published_at=f"2026-08-{10+i}",
+            ))
+            put_article(store, _make_article(
+                article_hash=f"social-{i}", competitor_tag="Bosch", content_kind="social",
+                link=f"https://example.com/social-{i}", published_at=f"2026-08-{10+i}",
+            ))
+
+        result = articles_for_company(store, "Bosch", kind="social", limit=3)
+        assert len(result) == 3
+        assert all(a["article_hash"].startswith("social-") for a in result)
+
+    def test_articles_for_companies_kind_filter(self, store):
+        put_article(store, _make_article(
+            article_hash="bosch-social", competitor_tag="Bosch", content_kind="social",
+            link="https://example.com/bosch-social", published_at="2026-08-05",
+        ))
+        put_article(store, _make_article(
+            article_hash="valeo-news", competitor_tag="Valeo", content_kind="news",
+            link="https://example.com/valeo-news", published_at="2026-08-06",
+        ))
+
+        result = articles_for_companies(store, ["Bosch", "Valeo"], kind="social")
+        assert [a["article_hash"] for a in result] == ["bosch-social"]
+
+    def test_content_kind_defaults_to_news(self, store):
+        put_article(store, _make_article(article_hash="default-kind", link="https://example.com/dk"))
+        assert get_article(store, "default-kind")["content_kind"] == "news"
+        assert [a["article_hash"] for a in articles_by_kind(store, "news")] == ["default-kind"]

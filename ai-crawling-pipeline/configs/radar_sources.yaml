@@ -674,6 +674,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "valeo"
 
   - name: "Bosch · LinkedIn"
@@ -682,6 +683,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "bosch"  # Bosch (Mobility Aftermarket)
 
   - name: "ZF · LinkedIn"
@@ -690,6 +692,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "zf-group"  # ZF (Sachs, TRW, Lemförder, Wabco) — main page, no dedicated "ZF Aftermarket" page found
 
   - name: "MAHLE · LinkedIn"
@@ -698,6 +701,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "mahle"  # MAHLE Aftermarket
 
   - name: "Marelli · LinkedIn"
@@ -706,6 +710,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "magneti-marelli-parts-and-services"  # Magneti Marelli (now Marelli)
 
   - name: "Schaeffler · LinkedIn"
@@ -714,6 +719,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "schaeffler"  # Schaeffler (LuK, INA, FAG)
 
   - name: "Tenneco · LinkedIn"
@@ -722,6 +728,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "tenneco"  # Tenneco (Monroe, DRiV)
 
   - name: "Continental · LinkedIn"
@@ -730,6 +737,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "continental"  # Continental (ATE, VDO) — main page, no dedicated aftermarket page found
 
   - name: "Denso · LinkedIn"
@@ -738,6 +746,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "densopartseu"  # Denso — main page, no dedicated "Denso Aftermarket" page found
 
   - name: "SKF · LinkedIn"
@@ -746,6 +755,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "skf"  # SKF — main page, no dedicated "SKF Automotive" page found
 
   - name: "Nakata · LinkedIn"
@@ -754,6 +764,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "nakata-uk"
 
   - name: "Fras-le · LinkedIn"
@@ -762,6 +773,7 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "frasleuk"
 
   - name: "Randon · LinkedIn"
@@ -770,4 +782,5 @@ sources:
     product_line: "Geral"
     category: auto
     feed_type: linkedin_company
+    content_kind: social
     query_text: "randon"  # Randoncorp (Controil, Lonaflex)

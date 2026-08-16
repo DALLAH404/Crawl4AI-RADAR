@@ -1,6 +1,6 @@
 """DynamoDB storage layer for the Radar Aftermarket Pipeline.
 
-Single table, four GSIs. Identity is `article_hash` (md5 of the resolved
+Single table, five GSIs. Identity is `article_hash` (md5 of the resolved
 article URL) everywhere — there is no auto-increment ID; DynamoDB has no
 equivalent of SQLite's ROWID, and keying writes off a value derived from
 the article itself is what makes them idempotent (a re-scraped article
@@ -16,6 +16,9 @@ Item types (all in the one `radar-articles` table):
                                                                       is 'pending' or
                                                                       'failed' — see
                                                                       retry_failed_articles)
+                     gsi5pk=KIND#<content_kind> gsi5sk=<ts>#<hash>   (KindIndex — always
+                                                                      set, every article
+                                                                      has exactly one kind)
 
     Raw-link pointer pk=ARTICLE#<hash>          sk=RAWLINK#<rawhash>
                      gsi3pk=RAWLINK#<rawhash>   gsi3sk=METADATA      (DedupIndex)
@@ -23,9 +26,13 @@ Item types (all in the one `radar-articles` table):
     Company link     pk=ARTICLE#<hash>          sk=COMPANY#<tag>
                      gsi1pk=COMPANY#<tag>       gsi1sk=<ts>#<hash>   (CompanyTimeIndex)
                      (denormalized display fields, so the per-company feed
-                     reads in one Query with no follow-up GetItem)
+                     reads in one Query with no follow-up GetItem; also
+                     carries content_kind as a plain attribute — not a GSI
+                     key here — for the company+kind combined query, which
+                     filters CompanyTimeIndex rather than needing its own
+                     index. See articles_for_company's docstring.)
 
-All four GSIs project ALL attributes — item sizes here are tiny (a news
+All five GSIs project ALL attributes — item sizes here are tiny (a news
 article's text, not a blob) so the extra storage/WCU cost buys skipping an
 N+1 GetItem on every read path.
 
@@ -46,8 +53,9 @@ Public API:
     failed_articles(store, limit=None) -> list[dict]
     retry_failed_articles(store) -> int
     latest_articles(store, limit=20) -> list[dict]
-    articles_for_company(store, company, since_ts, until_ts=None, limit=None) -> list[dict]
-    articles_for_companies(store, companies, since_ts, until_ts=None, limit=None) -> list[dict]
+    articles_by_kind(store, kind, limit=20) -> list[dict]
+    articles_for_company(store, company, since_ts=None, until_ts=None, kind=None, limit=None) -> list[dict]
+    articles_for_companies(store, companies, since_ts=None, until_ts=None, kind=None, limit=None) -> list[dict]
     mark_article_irrelevant(store, article_hash) -> None
     mark_article_failed(store, article_hash, error="") -> None
     article_count(store) -> int
@@ -74,6 +82,7 @@ DEFAULT_TABLE_NAME = "radar-articles"
 _INTERNAL_KEYS = {
     "pk", "sk",
     "gsi1pk", "gsi1sk", "gsi2pk", "gsi2sk", "gsi3pk", "gsi3sk", "gsi4pk", "gsi4sk",
+    "gsi5pk", "gsi5sk",
 }
 
 
@@ -98,7 +107,7 @@ def connect(
 
 
 def ensure_table(store: RadarStore) -> None:
-    """Create the table (on-demand billing) with its 4 GSIs if it doesn't
+    """Create the table (on-demand billing) with its 5 GSIs if it doesn't
     already exist. Local/dev only — see the module docstring."""
     client = store.table.meta.client
     table_name = store.table.table_name
@@ -119,6 +128,8 @@ def ensure_table(store: RadarStore) -> None:
             {"AttributeName": "gsi3sk", "AttributeType": "S"},
             {"AttributeName": "gsi4pk", "AttributeType": "S"},
             {"AttributeName": "gsi4sk", "AttributeType": "S"},
+            {"AttributeName": "gsi5pk", "AttributeType": "S"},
+            {"AttributeName": "gsi5sk", "AttributeType": "S"},
         ],
         KeySchema=[
             {"AttributeName": "pk", "KeyType": "HASH"},
@@ -154,6 +165,14 @@ def ensure_table(store: RadarStore) -> None:
                 "KeySchema": [
                     {"AttributeName": "gsi4pk", "KeyType": "HASH"},
                     {"AttributeName": "gsi4sk", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            },
+            {
+                "IndexName": "KindIndex",
+                "KeySchema": [
+                    {"AttributeName": "gsi5pk", "KeyType": "HASH"},
+                    {"AttributeName": "gsi5sk", "KeyType": "RANGE"},
                 ],
                 "Projection": {"ProjectionType": "ALL"},
             },
@@ -230,6 +249,7 @@ def _base_item(article: Article) -> dict:
         "source_id": article.source_id,
         "source_name": article.source_name,
         "feed_type": article.feed_type,
+        "content_kind": article.content_kind,
         "dedup_layer": article.dedup_layer,
         "dedup_decision": article.dedup_decision,
         "dedup_reason": article.dedup_reason,
@@ -238,6 +258,10 @@ def _base_item(article: Article) -> dict:
         "extra": article.extra,
         "gsi2pk": "ARTICLE",
         "gsi2sk": f"{ts}#{article.article_hash}",
+        # Not sparse — every article has exactly one content_kind (defaults
+        # to "news"), so this is always set, unlike gsi4 below.
+        "gsi5pk": f"KIND#{article.content_kind}",
+        "gsi5sk": f"{ts}#{article.article_hash}",
     }
     if article.title_hash:
         item["gsi3pk"] = f"TITLEHASH#{article.title_hash}"
@@ -283,6 +307,10 @@ def _company_item(article: Article, tag: str) -> dict:
         "summary": article.summary,
         "summary_status": article.summary_status,
         "published_at": ts,
+        # Plain attribute here, not a GSI key — used by articles_for_company's
+        # optional kind filter (a FilterExpression against CompanyTimeIndex,
+        # not a dedicated index; see that function's docstring for why).
+        "content_kind": article.content_kind,
     }
     return {k: v for k, v in item.items() if v not in (None, "")}
 
@@ -454,34 +482,92 @@ def latest_articles(store: RadarStore, limit: int = 20) -> list[dict]:
     return [_as_full_article(i) for i in resp.get("Items", [])]
 
 
-def articles_for_company(
+def articles_by_kind(store: RadarStore, kind: str, limit: int = 20) -> list[dict]:
+    """The "everything of one kind, no company" feed — the News/Social
+    filter's un-companied case. Same shape as latest_articles, just scoped
+    to KindIndex's gsi5pk instead of LatestIndex's constant one."""
+    resp = store.table.query(
+        IndexName="KindIndex",
+        KeyConditionExpression=Key("gsi5pk").eq(f"KIND#{kind}"),
+        ScanIndexForward=False,
+        Limit=limit,
+    )
+    return [_as_full_article(i) for i in resp.get("Items", [])]
+
+
+def _query_company(
     store: RadarStore,
     company: str,
-    since_ts: str,
-    until_ts: str | None = None,
-    limit: int | None = None,
+    since_ts: str | None,
+    until_ts: str | None,
+    kind: str | None,
+    limit: int | None,
 ) -> list[dict]:
+    """One company's link items, optionally date-bounded and/or
+    kind-filtered. Returns raw items (internal keys included) — callers
+    clean/dedupe as needed.
+
+    kind filtering uses a FilterExpression against content_kind
+    (denormalized onto every company-link item — see _company_item) rather
+    than a dedicated index: a single company's result set is already narrow
+    (bounded by that company, often further bounded by since_ts/until_ts
+    too), so it doesn't need the same treatment as "kind alone, no company"
+    (articles_by_kind / KindIndex), which could otherwise span the whole
+    table.
+
+    DynamoDB's Limit applies to items *evaluated*, before the
+    FilterExpression runs — so a single Query can come back with fewer than
+    `limit` matching items even though more exist. This loops on
+    LastEvaluatedKey until either `limit` matches are collected or the
+    company's results (within the date range) are exhausted, so a caller
+    asking for `limit` items actually gets that many when they exist.
+    """
     key_cond = Key("gsi1pk").eq(f"COMPANY#{company}")
-    if until_ts:
+    if since_ts and until_ts:
         key_cond &= Key("gsi1sk").between(since_ts, f"{until_ts}￿")
-    else:
+    elif since_ts:
         key_cond &= Key("gsi1sk").gte(since_ts)
+    elif until_ts:
+        key_cond &= Key("gsi1sk").lte(f"{until_ts}￿")
+
     kwargs: dict[str, Any] = {
         "IndexName": "CompanyTimeIndex",
         "KeyConditionExpression": key_cond,
         "ScanIndexForward": False,
     }
-    if limit:
-        kwargs["Limit"] = limit
-    resp = store.table.query(**kwargs)
-    return [_clean(i) for i in resp.get("Items", [])]
+    if kind:
+        kwargs["FilterExpression"] = Attr("content_kind").eq(kind)
+
+    items: list[dict] = []
+    while True:
+        resp = store.table.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        if limit and len(items) >= limit:
+            break
+        last_key = resp.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
+    return items[:limit] if limit else items
+
+
+def articles_for_company(
+    store: RadarStore,
+    company: str,
+    since_ts: str | None = None,
+    until_ts: str | None = None,
+    kind: str | None = None,
+    limit: int | None = None,
+) -> list[dict]:
+    return [_clean(i) for i in _query_company(store, company, since_ts, until_ts, kind, limit)]
 
 
 def articles_for_companies(
     store: RadarStore,
     companies: list[str],
-    since_ts: str,
+    since_ts: str | None = None,
     until_ts: str | None = None,
+    kind: str | None = None,
     limit: int | None = None,
 ) -> list[dict]:
     # DynamoDB Query takes one partition-key value at a time, so an OR
@@ -491,11 +577,12 @@ def articles_for_companies(
     seen: set[str] = set()
     merged: list[dict] = []
     for company in companies:
-        for item in articles_for_company(store, company, since_ts, until_ts, limit):
-            if item["article_hash"] in seen:
+        for item in _query_company(store, company, since_ts, until_ts, kind, limit):
+            article_hash = item["article_hash"]
+            if article_hash in seen:
                 continue
-            seen.add(item["article_hash"])
-            merged.append(item)
+            seen.add(article_hash)
+            merged.append(_clean(item))
     merged.sort(key=lambda i: i.get("published_at", ""), reverse=True)
     return merged[:limit] if limit else merged
 
