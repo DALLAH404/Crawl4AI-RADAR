@@ -4,7 +4,10 @@
   position: relative;
   width: 150px;
   height: 150px;
-  background: transparent;
+  /* Solid, not transparent — the dashed rings/sweep below are styled
+     dark-on-dark and need this dial to stay a self-contained dark "radar
+     screen" even when the surrounding page background is light. */
+  background: #050806;
   border-radius: 50%;
   box-shadow: 25px 25px 75px rgba(0, 0, 0, 0.55);
   border: 1px solid #333;

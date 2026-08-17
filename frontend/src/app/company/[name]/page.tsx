@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import { getArticles } from "@/lib/api";
 import { ArticleCard } from "@/components/ArticleCard";
+import { MenuBar } from "@/components/MenuBar";
 import { KindToggle } from "@/components/KindToggle";
 import { companyColor } from "@/lib/companyColor";
 import type { ContentKind } from "@/lib/types";
@@ -43,6 +44,7 @@ export default async function CompanyPage({
 
   return (
     <div className="flex flex-1 flex-col">
+      <MenuBar />
       <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-6 px-4 py-6">
         <div>
           <Link href="/" className="text-sm text-muted-foreground hover:text-foreground">
@@ -71,7 +73,7 @@ export default async function CompanyPage({
             No articles for {name} yet{kind ? ` in ${kind}` : ""}.
           </p>
         ) : (
-          <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="grid gap-4 sm:grid-cols-2">
             {items.map((article) => (
               <ArticleCard key={article.article_hash} article={article} />
             ))}

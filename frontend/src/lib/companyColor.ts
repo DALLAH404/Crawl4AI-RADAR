@@ -29,8 +29,15 @@ function hashString(value: string): number {
   return Math.abs(hash);
 }
 
+// Valeo's brand color is green, so it's pinned to that slot instead of
+// whatever the hash happens to land on.
+const SLOT_OVERRIDES: Record<string, number> = {
+  valeo: 5, // green
+};
+
 export function companyColor(name: string): { light: string; dark: string } {
-  const index = hashString(name.trim().toLowerCase()) % COMPANY_COLOR_SLOTS.length;
+  const key = name.trim().toLowerCase();
+  const index = key in SLOT_OVERRIDES ? SLOT_OVERRIDES[key] : hashString(key) % COMPANY_COLOR_SLOTS.length;
   const [light, dark] = COMPANY_COLOR_SLOTS[index];
   return { light, dark };
 }

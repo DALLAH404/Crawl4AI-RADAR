@@ -24,3 +24,20 @@ export function formatRelative(published_at: string): string {
   if (diffDays < 7) return `${diffDays}d ago`;
   return formatDate(published_at);
 }
+
+// Compares calendar dates in the *viewer's* local timezone, which is why
+// NewBadge (the only caller) is client-mount-gated rather than calling this
+// directly during a shared server/client render — the server's "today" can
+// differ from a viewer's near a local midnight, the same class of mismatch
+// formatRelative had.
+export function isPublishedToday(published_at: string): boolean {
+  if (!published_at) return false;
+  const date = new Date(published_at);
+  if (Number.isNaN(date.getTime())) return false;
+  const today = new Date();
+  return (
+    date.getFullYear() === today.getFullYear() &&
+    date.getMonth() === today.getMonth() &&
+    date.getDate() === today.getDate()
+  );
+}

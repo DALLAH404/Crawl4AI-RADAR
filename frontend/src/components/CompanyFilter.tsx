@@ -76,15 +76,29 @@ export function CompanyFilter() {
     applySelection(next);
   }
 
+  const active = selected.length > 0;
+
   return (
-    <div className="relative" ref={containerRef}>
+    <div className={`relative border-l-2 pl-2.5 ${active ? "border-primary" : "border-transparent"}`} ref={containerRef}>
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
         className="flex w-full items-center justify-between rounded-md border border-border bg-card px-2 py-1.5 text-sm font-medium text-card-foreground hover:bg-accent hover:text-accent-foreground"
       >
-        Companies{selected.length ? ` (${selected.length})` : ""}
+        <span className="flex items-center gap-1.5">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            className={`size-3.5 ${active ? "text-primary" : "text-muted-foreground"}`}
+            aria-hidden="true"
+          >
+            <path d="M3 21h18M6 21V7l6-4 6 4v14M10 10h.01M14 10h.01M10 14h.01M14 14h.01" strokeLinecap="round" />
+          </svg>
+          Companies{selected.length ? ` (${selected.length})` : ""}
+        </span>
         <svg
           viewBox="0 0 24 24"
           fill="none"

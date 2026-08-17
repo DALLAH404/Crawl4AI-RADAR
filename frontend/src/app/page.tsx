@@ -1,5 +1,7 @@
 import { getArticles } from "@/lib/api";
 import { Hero } from "@/components/Hero";
+import { MenuBar } from "@/components/MenuBar";
+import { StockTicker } from "@/components/StockTicker";
 import { CompanyCarousel } from "@/components/CompanyCarousel";
 import { CompanyHighlightCard } from "@/components/CompanyHighlightCard";
 import { FilterSidebar } from "@/components/FilterSidebar";
@@ -102,7 +104,9 @@ export default async function Home({ searchParams }: PageProps<"/">) {
 
   return (
     <div className="flex flex-1 flex-col">
+      <StockTicker />
       <Hero />
+      <MenuBar />
       <CompanyCarousel highlights={unfiltered.slice(0, CAROUSEL_SIZE)} />
       <main className="flex w-full flex-1 flex-col gap-6 px-6 py-6 lg:flex-row lg:gap-8">
         <FilterSidebar />
@@ -111,7 +115,7 @@ export default async function Home({ searchParams }: PageProps<"/">) {
           {highlights.length === 0 ? (
             <EmptyState />
           ) : (
-            <div className="grid gap-5 sm:grid-cols-2">
+            <div className="grid gap-4 sm:grid-cols-2">
               {highlights.map(({ company, article }) => (
                 <CompanyHighlightCard key={article.article_hash} company={company} article={article} />
               ))}

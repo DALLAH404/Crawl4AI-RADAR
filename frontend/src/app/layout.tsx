@@ -2,7 +2,6 @@ import type { Metadata } from "next";
 import { Alexandria, Noto_Serif, JetBrains_Mono, Archivo } from "next/font/google";
 import { ThemeProvider } from "next-themes";
 import { Header } from "@/components/Header";
-import { StockTicker } from "@/components/StockTicker";
 import "./globals.css";
 
 // Fonts match the design tokens in globals.css (--font-sans/--font-serif/
@@ -52,7 +51,6 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       <body className="min-h-full flex flex-col bg-background text-foreground font-sans">
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
           <Header />
-          <StockTicker />
           {children}
         </ThemeProvider>
       </body>

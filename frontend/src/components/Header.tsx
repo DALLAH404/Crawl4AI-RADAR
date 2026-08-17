@@ -7,7 +7,7 @@ export function Header() {
       <div className="relative mx-auto flex max-w-5xl items-center justify-end px-4 py-3">
         <Link
           href="/"
-          className="absolute left-1/2 -translate-x-1/2 font-sans text-xl font-bold tracking-tight text-primary"
+          className="absolute left-1/2 -translate-x-1/2 font-sans text-xl font-bold tracking-tight text-primary [text-shadow:0_1px_3px_rgba(0,0,0,0.2)] dark:[text-shadow:none]"
         >
           RADAR
         </Link>

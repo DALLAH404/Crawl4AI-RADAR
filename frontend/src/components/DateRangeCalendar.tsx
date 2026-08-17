@@ -69,10 +69,23 @@ export function DateRangeCalendar() {
     return list;
   }, [year, month, firstWeekday, totalDays]);
 
+  const active = Boolean(draftFrom || draftTo);
+
   return (
-    <div>
+    <div className={`border-l-2 pl-2.5 ${active ? "border-primary" : "border-transparent"}`}>
       <div className="flex items-center justify-between pb-2">
-        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            className={`size-3.5 ${active ? "text-primary" : ""}`}
+            aria-hidden="true"
+          >
+            <rect x="3" y="4" width="18" height="17" rx="2" />
+            <path d="M3 9h18M8 2v4M16 2v4" strokeLinecap="round" />
+          </svg>
           Timeframe
         </span>
         {(draftFrom || draftTo) && (

@@ -2,22 +2,26 @@
 
 import { useState } from "react";
 import type { Article } from "@/lib/types";
+import { companyColor } from "@/lib/companyColor";
 import { CompanyBadge } from "./CompanyBadge";
-import { AlertBadge } from "./AlertBadge";
+import { BookmarkButton } from "./BookmarkButton";
+import { NewBadge } from "./NewBadge";
 import { ArticleModal } from "./ArticleModal";
 import { CompanyLogoFallback } from "./CompanyLogoFallback";
 import { RelativeTime } from "./RelativeTime";
 
 export function ArticleCard({ article }: { article: Article }) {
   const [open, setOpen] = useState(false);
+  const primaryCompany = article.companies[0];
+  const strip = primaryCompany ? companyColor(primaryCompany) : null;
 
   return (
     <>
       <article
         onClick={() => setOpen(true)}
-        className="group flex cursor-pointer flex-col overflow-hidden rounded-xl border border-border bg-card transition-colors hover:border-primary/50"
+        className="group flex cursor-pointer flex-col overflow-hidden rounded-md bg-card shadow-lg shadow-gray-500/20 transition-[transform,box-shadow] hover:scale-[1.03] hover:shadow-2xl hover:shadow-gray-500/30"
       >
-        <div className="block aspect-[16/9] overflow-hidden bg-muted">
+        <div className="relative block aspect-[2/1] overflow-hidden bg-muted">
           {article.image_url ? (
             // eslint-disable-next-line @next/next/no-img-element -- external, unpredictable source hosts
             <img
@@ -33,30 +37,42 @@ export function ArticleCard({ article }: { article: Article }) {
               <RadarPlaceholder />
             </div>
           )}
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-teal-500/25 via-transparent to-orange-500/25 mix-blend-overlay" />
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/20 to-transparent" />
+          <div className="absolute right-1 top-1 rounded-full bg-background/80 backdrop-blur-sm">
+            <BookmarkButton article={article} size="sm" />
+          </div>
+          {strip && (
+            <>
+              <div className="absolute inset-x-0 bottom-0 h-1 dark:hidden" style={{ backgroundColor: strip.light }} aria-hidden="true" />
+              <div className="absolute inset-x-0 bottom-0 hidden h-1 dark:block" style={{ backgroundColor: strip.dark }} aria-hidden="true" />
+            </>
+          )}
         </div>
 
-        <div className="flex flex-1 flex-col gap-3 p-4">
-          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+        <div className="flex flex-1 flex-col gap-1.5 p-2.5">
+          <div className="flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
             <span><RelativeTime publishedAt={article.published_at} /></span>
+            {article.source_name && <span>· {article.source_name}</span>}
             {article.content_kind === "social" && (
-              <span className="rounded-full bg-muted px-2 py-0.5 font-medium text-muted-foreground">
+              <span className="rounded-full bg-muted px-1 py-0.5 font-medium text-muted-foreground">
                 Social
               </span>
             )}
-            <AlertBadge level={article.alert_level} />
+            <NewBadge publishedAt={article.published_at} />
           </div>
 
-          <span className="font-semibold text-foreground group-hover:text-primary">
+          <span className="text-xs font-semibold text-foreground group-hover:text-primary">
             {article.title}
           </span>
 
           {article.summary && (
-            <p className="line-clamp-3 text-sm text-muted-foreground">{article.summary}</p>
+            <p className="line-clamp-2 text-[11px] text-muted-foreground">{article.summary}</p>
           )}
 
           {article.companies.length > 0 && (
             <div
-              className="mt-auto flex flex-wrap gap-1.5 pt-1"
+              className="mt-auto flex flex-wrap gap-1 pt-1"
               onClick={(event) => event.stopPropagation()}
             >
               {article.companies.map((name) => (

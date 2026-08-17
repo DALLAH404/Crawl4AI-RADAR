@@ -17,6 +17,7 @@ export function KindFilter() {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const current = searchParams.get("kind") ?? "";
+  const active = current !== "";
 
   function select(value: string) {
     const params = new URLSearchParams(searchParams.toString());
@@ -26,28 +27,40 @@ export function KindFilter() {
   }
 
   return (
-    <div>
-      <span className="mb-2 block text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+    <div className={`border-l-2 pl-2.5 ${active ? "border-primary" : "border-transparent"}`}>
+      <span className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          className={`size-3.5 ${active ? "text-primary" : ""}`}
+          aria-hidden="true"
+        >
+          <path d="M4 6h16M4 12h16M4 18h16" strokeLinecap="round" />
+        </svg>
         Kind
       </span>
-      <ul className="space-y-0.5">
+      <div className="flex rounded-full bg-muted p-0.5">
         {OPTIONS.map((option) => {
           const checked = option.value === current;
           return (
-            <li key={option.value}>
-              <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-foreground hover:bg-accent hover:text-accent-foreground">
-                <input
-                  type="checkbox"
-                  checked={checked}
-                  onChange={() => select(checked ? "" : option.value)}
-                  className="size-3.5 rounded border-border accent-[var(--primary)]"
-                />
-                {option.label}
-              </label>
-            </li>
+            <button
+              key={option.value}
+              type="button"
+              onClick={() => select(option.value)}
+              aria-pressed={checked}
+              className={`flex-1 rounded-full px-2 py-1 text-xs font-medium transition-colors ${
+                checked
+                  ? "bg-primary text-primary-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {option.label}
+            </button>
           );
         })}
-      </ul>
+      </div>
     </div>
   );
 }
