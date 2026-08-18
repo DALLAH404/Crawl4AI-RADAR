@@ -41,7 +41,8 @@ from radar_pipeline.classify.rules import classify_article, eh_fora_de_escopo
 from radar_pipeline.db import find_by_article_hash, find_by_raw_link, put_article
 from radar_pipeline.models import Article, CollectionRun, CollectionStats
 from radar_pipeline.sources.feedparser import FeedFetchError, fetch_and_parse
-from radar_pipeline.sources.gnews import resolve_google_news_url
+from radar_pipeline.sources import gnews as gnews_source
+from radar_pipeline.sources.gnews import GNewsCollector, GNewsConfig, GNewsItem, resolve_google_news_url
 from radar_pipeline.sources.linkedin import (
     LinkedInBlockedError,
     company_page_url,
@@ -114,6 +115,7 @@ async def _fetch_items(
     client: httpx.AsyncClient,
     limiter: RateLimiter,
     config,
+    gnews: GNewsCollector | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch raw items for a source, in the ``feedparser`` item shape.
 
@@ -128,6 +130,23 @@ async def _fetch_items(
             )
         except LinkedInBlockedError as exc:
             raise FeedFetchError(f"linkedin blocked: {exc.reason}", url=_feed_url(source)) from exc
+
+    if source["feed_type"] == "google_news_query":
+        if gnews is None:
+            raise FeedFetchError("GNews collector is not configured", url=_feed_url(source))
+        query = source["query_text"] or source["tag"] or source["name"]
+        # Keep enough entries for either normal mode or backfill; the caller
+        # applies the mode-specific limit after the feed has been fetched.
+        max_items = max(config.max_items_per_feed, config.backfill_max_items)
+        try:
+            items = await gnews.search(query, max_items=max_items)
+            return [item.to_feed_item() for item in items]
+        except HostBlockedError as exc:
+            raise FeedFetchError(f"host blocked: {exc.host}", url=_feed_url(source)) from exc
+        except FeedFetchError:
+            raise
+        except Exception as exc:
+            raise FeedFetchError(str(exc), url=_feed_url(source)) from exc
 
     url = _feed_url(source)
     try:
@@ -154,6 +173,7 @@ async def _process_source(
     client: httpx.AsyncClient,
     limiter: RateLimiter,
     config,
+    gnews: GNewsCollector | None = None,
 ) -> CollectionRun:
     t0 = time.monotonic()
     run = CollectionRun(
@@ -167,7 +187,7 @@ async def _process_source(
     is_linkedin = source["feed_type"] == "linkedin_company"
 
     try:
-        items = await _fetch_items(source, client, limiter, config)
+        items = await _fetch_items(source, client, limiter, config, gnews)
 
         run.items_found = len(items)
 
@@ -182,7 +202,7 @@ async def _process_source(
             window = timedelta(days=config.days_back)
         cutoff = datetime.now(timezone.utc) - window
 
-        new_count = 0
+        candidates: list[dict[str, Any]] = []
         for item in items:
             if item["published_at"]:
                 try:
@@ -206,19 +226,26 @@ async def _process_source(
             if existing_raw is not None:
                 continue
 
-            if is_linkedin:
-                resolved_link = raw_link
-            else:
-                # New (or unrecorded) raw link — resolve it. The resolver
-                # also goes through the limiter.
-                try:
-                    resolved_link = await resolve_google_news_url(
-                        raw_link, client, limiter=limiter,
-                    )
-                except HostBlockedError as exc:
-                    raise FeedFetchError(
-                        f"host blocked during resolve: {exc.host}", url=raw_link,
-                    ) from exc
+            candidates.append(item)
+
+        # Resolution is deliberately a separate phase from collection and
+        # filtering.  In particular, raw-link dedup above avoids decoder calls
+        # for the large majority of recurring RSS entries.
+        resolved_items = [GNewsItem.from_feed_item(item) for item in candidates]
+        await gnews.resolve_all(resolved_items) if gnews is not None else None
+
+        new_count = 0
+        for item, resolved_item in zip(candidates, resolved_items):
+            if resolved_item.resolve_status == "failed":
+                logger.warning(
+                    "dropping unresolved GNews item for %s: %s",
+                    source["name"],
+                    resolved_item.resolve_error,
+                )
+                continue
+
+            raw_link = item["link"]
+            resolved_link = resolved_item.link
 
             article_hash = _md5(resolved_link)
 
@@ -346,19 +373,39 @@ async def collect_once(store, sources: list, config, mode: str = "normal") -> Co
 
         async def _bounded_rss(s: dict[str, Any]) -> CollectionRun:
             async with semaphore:
-                async with httpx.AsyncClient(
-                    timeout=30.0,
-                    limits=client_limits,
-                    follow_redirects=True,
-                ) as client:
-                    return await _process_source(
-                        store, s, batch_id, mode, client, limiter, config,
-                    )
+                return await _process_source(
+                    store, s, batch_id, mode, client, limiter, config, gnews,
+                )
 
-        rss_results = await asyncio.gather(
-            *(_bounded_rss(s) for s in rss_sources),
-            return_exceptions=True,
-        )
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            limits=client_limits,
+            follow_redirects=True,
+        ) as client:
+            resolve_function = (
+                None
+                if resolve_google_news_url is gnews_source.DEFAULT_RESOLVE_FUNCTION
+                else resolve_google_news_url
+            )
+            gnews = GNewsCollector(
+                GNewsConfig(
+                    max_items_per_query=max(config.max_items_per_feed, config.backfill_max_items),
+                    request_timeout=30.0,
+                    resolve_concurrency=max(1, int(config.gnews_concurrency)),
+                    resolve_max_retries=max(1, int(config.fetch_max_retries)),
+                    resolve_backoff_base=max(0.0, float(config.fetch_backoff_seconds)),
+                    search_concurrency=max(1, int(config.concurrency)),
+                    search_max_retries=max(0, int(config.fetch_max_retries)),
+                    search_backoff_seconds=max(0.0, float(config.fetch_backoff_seconds)),
+                ),
+                client=client,
+                limiter=limiter,
+                resolve_function=resolve_function,
+            )
+            rss_results = await asyncio.gather(
+                *(_bounded_rss(s) for s in rss_sources),
+                return_exceptions=True,
+            )
         _reduce_results(rss_sources, rss_results, batch_id, mode, stats)
 
     # LinkedIn pass — separate, low-concurrency: each source holds its slot

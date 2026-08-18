@@ -1,281 +1,453 @@
-"""Google News URL resolver — port of the 3-method resolver from codigo.gs.
+"""Google News RSS collection and link resolution.
 
-Methods (tried in order):
-    1. batchexecute API (Fbv4je/garturlreq payload)
-    2. HTTP redirect following (Location header + body canonical link)
-    3. Base64 decoding of articles/<id>
+Google News search has two separate operations:
 
-All outbound calls to ``news.google.com`` are routed through an
-optional ``RateLimiter`` shared with the feed fetcher. When the limiter
-reports a transient block (429 / 5xx) the resolver short-circuits and
-returns the original URL — the legacy chain tried all three methods
-against a blocked host, multiplying the Google News traffic by 3x per
-item, which is what the radar pipeline used to do and exactly the
-pattern that triggered the 503 block.
+1. Fetch and parse the RSS search feed.
+2. Decode ``news.google.com`` article links into publisher URLs.
+
+The decoder is blocking and maintained outside this project, so resolution
+uses ``googlenewsdecoder`` in a worker thread.  ``GNewsCollector`` keeps the
+two phases separate, caches successful resolutions, bounds concurrency, and
+retries decoder failures with backoff.  The pipeline injects its shared
+``httpx`` client and ``RateLimiter`` rather than creating another transport.
 """
 
 from __future__ import annotations
 
-import base64
-import json
+import asyncio
 import logging
+import random
 import re
-from typing import Any
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from html import unescape
+from time import mktime
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import quote
 
+import feedparser
 import httpx
+from googlenewsdecoder import gnewsdecoder
 
+from radar_pipeline.sources.feedparser import fetch_and_parse
 from radar_pipeline.sources.ratelimit import HostBlockedError, RateLimiter
 
 logger = logging.getLogger(__name__)
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0.0.0 Safari/537.36"
+
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
 
-def _decode_base64_url(article_id: str) -> str | None:
-    try:
-        padding = 4 - len(article_id) % 4
-        if padding != 4:
-            article_id += "=" * padding
-        article_id = article_id.replace("-", "+").replace("_", "/")
-        raw = base64.b64decode(article_id)
-        text = "".join(
-            chr(b) if 32 <= b < 127 else " "
-            for b in raw
+@dataclass
+class GNewsConfig:
+    """Settings for Google News search and URL resolution."""
+
+    hl: str = "pt-BR"
+    gl: str = "BR"
+    ceid: str = "BR:pt-419"
+    max_items_per_query: int = 25
+    request_timeout: float = 30.0
+    resolve_concurrency: int = 5
+    resolve_interval: float = 1.0
+    resolve_max_retries: int = 3
+    resolve_backoff_base: float = 2.0
+    search_concurrency: int = 5
+    search_delay_between: float = 0.0
+    user_agent: str = DEFAULT_UA
+    search_max_retries: int = 3
+    search_backoff_seconds: float = 2.0
+
+
+@dataclass
+class GNewsItem:
+    """A parsed Google News item with explicit resolution state."""
+
+    title: str
+    google_link: str
+    published: Optional[datetime]
+    source: str
+    summary: str = ""
+    image_url: str = ""
+    summary_html: str = ""
+    resolved_link: Optional[str] = None
+    resolve_status: str = "pending"
+    resolve_error: Optional[str] = None
+
+    @property
+    def link(self) -> str:
+        return self.resolved_link or self.google_link
+
+    @classmethod
+    def from_feed_item(cls, item: dict[str, Any]) -> "GNewsItem":
+        published = None
+        raw_published = item.get("published_at")
+        if raw_published:
+            try:
+                published = datetime.fromisoformat(raw_published.replace("Z", "+00:00"))
+                if published.tzinfo is None:
+                    published = published.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                pass
+
+        return cls(
+            title=item.get("title", ""),
+            google_link=item.get("link", ""),
+            published=published,
+            source=item.get("source", ""),
+            summary=item.get("summary_text", ""),
+            image_url=item.get("image_url", ""),
+            summary_html=item.get("summary_html", ""),
         )
-        m = re.search(r"https?://[^\s\"']+", text)
-        if m and "news.google" not in m.group(0):
-            return m.group(0).rstrip(
-                "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0e\x0f"
-                "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b"
-                "\x1c\x1d\x1e\x1f"
-            )
-    except Exception:
-        pass
-    return None
+
+    def to_feed_item(self) -> dict[str, Any]:
+        return {
+            "title": self.title,
+            "link": self.link,
+            "published_at": self.published.isoformat() if self.published else "",
+            "summary_html": self.summary_html,
+            "summary_text": self.summary,
+            "image_url": self.image_url,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "title": self.title,
+            "link": self.link,
+            "google_link": self.google_link,
+            "resolved_link": self.resolved_link,
+            "resolve_status": self.resolve_status,
+            "resolve_error": self.resolve_error,
+            "published": self.published.isoformat() if self.published else None,
+            "source": self.source,
+            "summary": self.summary,
+            "image_url": self.image_url,
+        }
 
 
-async def _gnews_get(
-    limiter: RateLimiter | None,
-    url: str,
-    client: httpx.AsyncClient,
-) -> httpx.Response | None:
-    """GET ``url``, honoring the limiter. None = blocked / network error."""
-    if limiter is not None:
-        if await limiter.is_blocked(url):
-            return None
-        try:
-            await limiter.acquire(url)
-        except HostBlockedError:
-            return None
-        try:
-            resp = await client.get(url, headers={"User-Agent": UA})
-        finally:
-            limiter.release(url)
-    else:
-        resp = await client.get(url, headers={"User-Agent": UA})
+_TAG_RE = re.compile(r"<[^>]+>")
 
-    if limiter is not None:
-        _record(limiter, url, resp)
-    if resp.status_code in (429,) or 500 <= resp.status_code < 600:
+
+def _clean_html(value: str) -> str:
+    if not value:
+        return ""
+    return unescape(_TAG_RE.sub(" ", value)).strip()
+
+
+def _parse_entry_date(entry: Any) -> Optional[datetime]:
+    struct = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not struct:
         return None
-    return resp
+    return datetime.fromtimestamp(mktime(struct), tz=timezone.utc)
 
 
-async def _gnews_post(
-    limiter: RateLimiter | None,
-    url: str,
-    client: httpx.AsyncClient,
-    content: str,
-) -> httpx.Response | None:
-    if limiter is not None:
-        if await limiter.is_blocked(url):
-            return None
-        try:
-            await limiter.acquire(url)
-        except HostBlockedError:
-            return None
-        try:
-            resp = await client.post(
-                url,
-                content=content,
-                headers={
-                    "User-Agent": UA,
-                    "Content-Type":
-                        "application/x-www-form-urlencoded;charset=UTF-8",
-                },
+def _extract_source(entry: Any) -> str:
+    source = entry.get("source")
+    if source and getattr(source, "title", None):
+        return source.title
+    if isinstance(source, dict) and source.get("title"):
+        return source["title"]
+
+    title = entry.get("title", "")
+    if " - " in title:
+        return title.rsplit(" - ", 1)[-1].strip()
+    return ""
+
+
+def _parse_feed_text(raw_xml: str) -> list[Any]:
+    return feedparser.parse(raw_xml).entries
+
+
+def _is_google_news_link(url: str) -> bool:
+    return "news.google" in (url or "")
+
+
+ResolveFunction = Callable[
+    [str, Optional[httpx.AsyncClient], Optional[RateLimiter]], Awaitable[str]
+]
+
+
+class GNewsCollector:
+    """Two-phase Google News collector adapted to the radar pipeline."""
+
+    @staticmethod
+    def _is_google_news_link(url: str) -> bool:
+        return _is_google_news_link(url)
+
+    def __init__(
+        self,
+        config: Optional[GNewsConfig] = None,
+        *,
+        client: Optional[httpx.AsyncClient] = None,
+        limiter: Optional[RateLimiter] = None,
+        resolve_function: Optional[ResolveFunction] = None,
+    ):
+        self.cfg = config or GNewsConfig()
+        self.client = client
+        self.limiter = limiter
+        self._resolve_function = resolve_function
+        self._resolve_cache: dict[str, str] = {}
+        self._resolve_sema = asyncio.Semaphore(max(1, self.cfg.resolve_concurrency))
+        self._owned_client = False
+
+    async def __aenter__(self) -> "GNewsCollector":
+        await self.start()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
+
+    async def start(self) -> None:
+        if self.client is None:
+            self.client = httpx.AsyncClient(
+                timeout=self.cfg.request_timeout,
+                follow_redirects=True,
+                headers={"User-Agent": self.cfg.user_agent},
             )
-        finally:
-            limiter.release(url)
-    else:
-        resp = await client.post(
+            self._owned_client = True
+
+    async def close(self) -> None:
+        if self._owned_client and self.client is not None:
+            await self.client.aclose()
+            self.client = None
+            self._owned_client = False
+
+    def _require_client(self) -> httpx.AsyncClient:
+        if self.client is None:
+            raise RuntimeError(
+                "No httpx client available. Use 'async with GNewsCollector()' "
+                "or pass client= explicitly."
+            )
+        return self.client
+
+    def build_search_url(self, query: str, when_days: Optional[int] = None) -> str:
+        q = query if not (when_days and when_days > 0) else f"{query} when:{when_days}d"
+        return (
+            "https://news.google.com/rss/search?q="
+            f"{quote(q)}&hl={self.cfg.hl}&gl={self.cfg.gl}&ceid={self.cfg.ceid}"
+        )
+
+    async def search(
+        self,
+        query: str,
+        *,
+        when_days: Optional[int] = None,
+        max_items: Optional[int] = None,
+        min_date: Optional[datetime] = None,
+    ) -> list[GNewsItem]:
+        """Fetch and parse RSS without resolving article links."""
+        client = self._require_client()
+        url = self.build_search_url(query, when_days)
+        feed_items = await fetch_and_parse(
             url,
-            content=content,
-            headers={
-                "User-Agent": UA,
-                "Content-Type":
-                    "application/x-www-form-urlencoded;charset=UTF-8",
-            },
+            client,
+            limiter=self.limiter,
+            user_agent=self.cfg.user_agent,
+            max_retries=self.cfg.search_max_retries,
+            backoff_seconds=self.cfg.search_backoff_seconds,
+            timeout_seconds=self.cfg.request_timeout,
         )
 
-    if limiter is not None:
-        _record(limiter, url, resp)
-    if resp.status_code in (429,) or 500 <= resp.status_code < 600:
-        return None
-    return resp
+        limit = max_items or self.cfg.max_items_per_query
+        result = [GNewsItem.from_feed_item(item) for item in feed_items[:limit]]
+        if min_date is not None:
+            result = [
+                item for item in result
+                if item.published is None or item.published >= min_date
+            ]
+        return result
 
+    async def search_many(
+        self,
+        queries: list[str],
+        *,
+        when_days: Optional[int] = None,
+        max_items: Optional[int] = None,
+        min_date: Optional[datetime] = None,
+    ) -> dict[str, list[GNewsItem] | Exception]:
+        """Search multiple queries concurrently, isolating per-query errors."""
+        sema = asyncio.Semaphore(max(1, self.cfg.search_concurrency))
+        results: dict[str, list[GNewsItem] | Exception] = {}
 
-def _record(limiter: RateLimiter, url: str, resp: httpx.Response) -> None:
-    retry_after = None
-    ra = resp.headers.get("retry-after")
-    if ra:
+        async def _one(query: str) -> None:
+            async with sema:
+                try:
+                    results[query] = await self.search(
+                        query,
+                        when_days=when_days,
+                        max_items=max_items,
+                        min_date=min_date,
+                    )
+                except Exception as exc:  # noqa: BLE001 - isolate sources
+                    logger.warning("GNews search failed for %r: %s", query, exc)
+                    results[query] = exc
+                if self.cfg.search_delay_between:
+                    await asyncio.sleep(self.cfg.search_delay_between)
+
+        await asyncio.gather(*(_one(query) for query in queries))
+        return results
+
+    async def _resolve_once(self, google_link: str) -> str:
+        acquired = False
+        if self.limiter is not None:
+            await self.limiter.acquire(google_link)
+            acquired = True
+
         try:
-            retry_after = float(ra)
-        except ValueError:
-            retry_after = None
-    if resp.status_code == 200:
-        limiter.record_success(url)
-    else:
-        limiter.record_failure(url, status=resp.status_code, retry_after=retry_after)
+            try:
+                result = await asyncio.to_thread(
+                    gnewsdecoder,
+                    google_link,
+                    interval=self.cfg.resolve_interval,
+                )
+            except Exception:
+                if self.limiter is not None:
+                    self.limiter.record_failure(google_link)
+                raise
 
+            if result.get("status") and result.get("decoded_url"):
+                if self.limiter is not None:
+                    self.limiter.record_success(google_link)
+                return result["decoded_url"]
 
-async def _resolve_via_batchexecute(
-    client: httpx.AsyncClient,
-    url: str,
-    article_id: str,
-    limiter: RateLimiter | None = None,
-) -> str | None:
-    try:
-        resp = await _gnews_get(limiter, url, client)
-        if resp is None or resp.status_code != 200:
-            return None
-        html = resp.text
+            message = result.get("message", "unknown decode failure")
+            if self.limiter is not None:
+                self.limiter.record_failure(google_link)
+            raise RuntimeError(message)
+        finally:
+            if acquired and self.limiter is not None:
+                self.limiter.release(google_link)
 
-        m_sig = re.search(r'data-n-a-sg="([^"]+)"', html)
-        m_ts = re.search(r'data-n-a-ts="([^"]+)"', html)
-        if not m_sig or not m_ts:
-            return None
+    async def resolve_link(self, google_link: str) -> str:
+        """Resolve one link with cache, bounded concurrency, and retries."""
+        if not _is_google_news_link(google_link):
+            return google_link
 
-        sig = m_sig.group(1)
-        ts = m_ts.group(1)
+        cached = self._resolve_cache.get(google_link)
+        if cached is not None:
+            return cached
 
-        inner = json.dumps([
-            "garturlreq",
-            [
-                ["X", "X", ["X", "X"], None, None, 1, 1, "US:en",
-                 None, 1, None, None, None, None, None, 0, 1],
-                "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0,
-            ],
-            article_id, ts, sig,
-        ])
+        async with self._resolve_sema:
+            cached = self._resolve_cache.get(google_link)
+            if cached is not None:
+                return cached
 
-        payload_data = [[["Fbv4je", inner, None, "generic"]]]
-        payload = "f.req=" + quote(json.dumps(payload_data))
+            last_error: Optional[str] = None
+            for attempt in range(1, self.cfg.resolve_max_retries + 1):
+                try:
+                    if self._resolve_function is None:
+                        real_url = await self._resolve_once(google_link)
+                    else:
+                        real_url = await self._resolve_function(
+                            google_link, self.client, limiter=self.limiter,
+                        )
+                    if real_url and not _is_google_news_link(real_url):
+                        self._resolve_cache[google_link] = real_url
+                        return real_url
+                    last_error = "decoder returned another Google News link"
+                except HostBlockedError as exc:
+                    last_error = str(exc)
+                    break
+                except Exception as exc:  # noqa: BLE001 - retry decoder failures
+                    last_error = str(exc)
 
-        endpoint = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
-        resp2 = await _gnews_post(limiter, endpoint, client, payload)
-        if resp2 is None:
-            return None
+                if attempt < self.cfg.resolve_max_retries:
+                    if self.cfg.resolve_backoff_base > 0:
+                        sleep_for = (
+                            self.cfg.resolve_backoff_base ** attempt
+                            + random.uniform(0.0, 1.0)
+                        )
+                    else:
+                        sleep_for = 0.0
+                    logger.debug(
+                        "GNews resolve attempt %d/%d failed for %s (%s); "
+                        "retrying in %.1fs",
+                        attempt,
+                        self.cfg.resolve_max_retries,
+                        google_link,
+                        last_error,
+                        sleep_for,
+                    )
+                    await asyncio.sleep(sleep_for)
 
-        text = resp2.text
-        m_real = re.search(r"https?://(?!news\.google)[^\\\"\s]+", text)
-        if m_real:
-            return m_real.group(0).replace("\\u003d", "=").replace("\\u0026", "&")
-    except Exception:
-        pass
-    return None
+            logger.warning("Giving up resolving %s: %s", google_link, last_error)
+            raise RuntimeError(last_error or "failed to resolve Google News link")
 
+    async def resolve_all(self, items: list[GNewsItem]) -> list[GNewsItem]:
+        """Resolve items in place; failures remain marked for later retry."""
+        async def _one(item: GNewsItem) -> None:
+            if not _is_google_news_link(item.google_link):
+                item.resolved_link = item.google_link
+                item.resolve_status = "skipped"
+                return
+            try:
+                item.resolved_link = await self.resolve_link(item.google_link)
+                item.resolve_status = "ok"
+            except Exception as exc:  # noqa: BLE001 - isolate each item
+                item.resolve_status = "failed"
+                item.resolve_error = str(exc)
 
-async def _resolve_via_redirect(
-    client: httpx.AsyncClient,
-    url: str,
-    limiter: RateLimiter | None = None,
-) -> str | None:
-    try:
-        resp = await _gnews_get(limiter, url, client)
-        if resp is None:
-            return None
-        final_url = str(resp.url)
-        if "news.google" not in final_url and final_url.startswith("http"):
-            return final_url
+        await asyncio.gather(*(_one(item) for item in items))
+        return items
 
-        body = resp.text
-        m_body = re.search(
-            r'<link[^>]+rel="canonical"[^>]+href="(https?://(?:news\.google)?[^"]+)"',
-            body, re.IGNORECASE,
-        )
-        if m_body and "news.google" not in m_body.group(1):
-            return m_body.group(1)
+    async def resolve_pending(self, items: list[GNewsItem]) -> list[GNewsItem]:
+        pending = [item for item in items if item.resolve_status == "failed"]
+        if pending:
+            await self.resolve_all(pending)
+        return items
 
-        m_au = re.search(r'data-n-au="(https?://[^"]+)"', body)
-        if m_au and "news.google" not in m_au.group(1):
-            return m_au.group(1)
-    except Exception:
-        pass
-    return None
+    # Kept as a small parsing seam for offline tests and callers that already
+    # consume the standalone collector package's parsing API.
+    def _items_from_feed_text(
+        self,
+        raw_xml: str,
+        *,
+        max_items: int,
+        min_date: Optional[datetime],
+    ) -> list[GNewsItem]:
+        items: list[GNewsItem] = []
+        for entry in _parse_feed_text(raw_xml)[:max_items]:
+            published = _parse_entry_date(entry)
+            if min_date and published and published < min_date:
+                continue
+            items.append(
+                GNewsItem(
+                    title=(entry.get("title") or "").strip(),
+                    google_link=(entry.get("link") or "").strip(),
+                    published=published,
+                    source=_extract_source(entry),
+                    summary=_clean_html(entry.get("summary", "")),
+                )
+            )
+        return items
 
 
 async def resolve_google_news_url(
     url: str,
-    client: httpx.AsyncClient | None = None,
+    client: Optional[httpx.AsyncClient] = None,
     *,
-    limiter: RateLimiter | None = None,
+    limiter: Optional[RateLimiter] = None,
 ) -> str:
-    """Resolve a Google News redirect URL to its underlying article URL.
+    """Resolve a Google News URL using the reference decoder implementation.
 
-    Returns ``url`` unchanged when it isn't a Google News link.
+    This compatibility function remains the fetch-stage entry point.  It
+    raises when a Google News link cannot be decoded; callers that need batch
+    isolation should use ``GNewsCollector.resolve_all``.
     """
-    if not url or "news.google" not in url:
+    if not url or not _is_google_news_link(url):
         return url
 
-    m = re.search(r"/articles/([^?/]+)", url)
-    if not m:
-        return url
-
-    article_id = m.group(1)
-    close_client = client is None
-    if client is None:
-        client = httpx.AsyncClient(
-            timeout=30.0, follow_redirects=True,
-        )
-
+    collector = GNewsCollector(client=client, limiter=limiter)
     try:
-        # 1) batchexecute
-        real = await _resolve_via_batchexecute(
-            client, url, article_id, limiter=limiter,
-        )
-        if real:
-            return real
-
-        # If the limiter tripped during the batchexecute step,
-        # stop: the remaining methods would only burn more requests
-        # against the same blocked Google host.
-        if limiter is not None and await limiter.is_blocked(url):
-            return url
-
-        # 2) redirect chain
-        real = await _resolve_via_redirect(client, url, limiter=limiter)
-        if real:
-            return real
-
-        if limiter is not None and await limiter.is_blocked(url):
-            return url
-
-        # 3) base64 decode — purely local, but only useful if the host
-        # is responsive: if Google is currently blocking us there is no
-        # cached underlying URL to find in the page body anyway.
-        if limiter is not None and await limiter.is_blocked(url):
-            return url
-
-        real = _decode_base64_url(article_id)
-        if real:
-            return real
+        return await collector.resolve_link(url)
     finally:
-        if close_client:
-            await client.aclose()
+        await collector.close()
 
-    return url
+
+# Collector tests and downstream integrations historically patched the
+# compatibility function.  The collection stage uses this marker to preserve
+# that injection seam without making the production path create a resolver
+# for every item.
+DEFAULT_RESOLVE_FUNCTION = resolve_google_news_url
