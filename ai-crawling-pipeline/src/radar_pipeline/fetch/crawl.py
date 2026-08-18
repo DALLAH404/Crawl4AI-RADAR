@@ -126,6 +126,18 @@ async def fetch_articles(
                     import httpx
                     async with httpx.AsyncClient(timeout=15.0) as img_client:
                         image_url = await fetch_og_image(target_url, img_client)
+                    if image_url:
+                        # Persisted right away, independent of whether the
+                        # heavier Crawl4AI crawl below succeeds. These are
+                        # two separate fetches against the same URL with very
+                        # different failure profiles (a lightweight httpx GET
+                        # here vs full browser automation there) — without
+                        # this, a successfully-fetched image was silently
+                        # discarded whenever the content crawl failed
+                        # afterward, since the only other image_url write
+                        # sits at the end of the function, gated on the whole
+                        # crawl succeeding.
+                        update_article(store, article["article_hash"], image_url=image_url)
 
                 target = Target(
                     slug=f"radar_{article['article_hash'][:12]}",
