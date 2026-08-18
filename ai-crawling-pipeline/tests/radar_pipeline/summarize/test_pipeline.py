@@ -77,6 +77,56 @@ async def test_run_summarize_does_not_crash_on_never_summarized_article(store, t
 
 
 @pytest.mark.asyncio
+async def test_run_summarize_replaces_title_with_llm_rewrite(store, tmp_path: Path, monkeypatch):
+    put_article(store, _fresh_pending_article(
+        article_hash="fresh-hash-title-1",
+        link="https://example.com/title-1",
+        title="…now have a new way to select and",
+    ))
+
+    async def fake_summarize_one(*, title, content, llm_settings, system_prompt, max_chars):
+        return SummarizeResult(
+            ok=True, relevant=True, summary="A concise summary.",
+            title="SKF launches a new bearing-selection platform",
+            event_type="Lancamento", alert_level="Baixo",
+        )
+
+    monkeypatch.setattr(pipeline_mod, "summarize_one", fake_summarize_one)
+
+    settings = SummarizeSettings(
+        output_dir=tmp_path,
+        llm=LLMSettings(base_url="https://example.invalid/v1", model="test-model"),
+    )
+    await pipeline_mod.run_summarize(store, settings)
+
+    updated = get_article(store, "fresh-hash-title-1")
+    assert updated["title"] == "SKF launches a new bearing-selection platform"
+
+
+@pytest.mark.asyncio
+async def test_run_summarize_falls_back_to_original_title_when_llm_omits_it(store, tmp_path: Path, monkeypatch):
+    put_article(store, _fresh_pending_article(
+        article_hash="fresh-hash-title-2",
+        link="https://example.com/title-2",
+        title="Bosch launches a new brake pad line",
+    ))
+
+    async def fake_summarize_one(*, title, content, llm_settings, system_prompt, max_chars):
+        return SummarizeResult(ok=True, relevant=True, summary="A concise summary.", title="")
+
+    monkeypatch.setattr(pipeline_mod, "summarize_one", fake_summarize_one)
+
+    settings = SummarizeSettings(
+        output_dir=tmp_path,
+        llm=LLMSettings(base_url="https://example.invalid/v1", model="test-model"),
+    )
+    await pipeline_mod.run_summarize(store, settings)
+
+    updated = get_article(store, "fresh-hash-title-2")
+    assert updated["title"] == "Bosch launches a new brake pad line"
+
+
+@pytest.mark.asyncio
 async def test_run_summarize_marks_irrelevant_without_crashing(store, tmp_path: Path, monkeypatch):
     put_article(store, _fresh_pending_article(article_hash="fresh-hash-2", link="https://example.com/2"))
 

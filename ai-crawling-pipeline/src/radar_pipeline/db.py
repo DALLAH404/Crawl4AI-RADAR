@@ -299,6 +299,7 @@ def _company_item(article: Article, tag: str) -> dict:
         "article_hash": article.article_hash,
         "company": tag,
         "title": article.title,
+        "action_description": article.action_description,
         "link": article.link,
         "image_url": article.image_url,
         "category": article.category,
@@ -433,7 +434,7 @@ def _status_queue(store: RadarStore, status: str, limit: int | None = None) -> l
         "IndexName": "PendingIndex",
         "KeyConditionExpression": Key("gsi4pk").eq(f"STATUS#{status}"),
         "FilterExpression": (
-            Attr("category").is_in(["auto", "economia"])
+            Attr("category").is_in(["auto", "economia", "tecnologia"])
             & (Attr("dedup_decision").not_exists() | Attr("dedup_decision").ne("duplicate"))
         ),
     }

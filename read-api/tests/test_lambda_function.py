@@ -146,7 +146,7 @@ class TestLatestArticles:
         assert "dedup_reason" not in article
         assert "raw_link" not in article
         assert set(article) == {
-            "article_hash", "title", "link", "image_url", "summary",
+            "article_hash", "title", "link", "image_url", "summary", "action_description",
             "competitor_analysis", "category", "content_kind", "event_type",
             "alert_level", "summary_status", "published_at", "companies", "source_name",
         }
@@ -267,6 +267,66 @@ class TestKindFiltering:
     def test_invalid_kind_rejected(self, table):
         resp = lf.handler(_event({"kind": "not-a-real-kind"}), None)
         assert resp["statusCode"] == 400
+
+
+class TestIrrelevantFiltering:
+    def test_latest_feed_excludes_irrelevant(self, table):
+        _put_base_item(table, article_hash="keep", published_at="2026-08-05")
+        _put_base_item(table, article_hash="drop", published_at="2026-08-06", summary_status="irrelevant")
+
+        body = json.loads(lf.handler(_event({}), None)["body"])
+        assert [a["article_hash"] for a in body["items"]] == ["keep"]
+
+    def test_kind_feed_excludes_irrelevant(self, table):
+        _put_base_item(table, article_hash="keep", published_at="2026-08-05", content_kind="social")
+        _put_base_item(
+            table, article_hash="drop", published_at="2026-08-06",
+            content_kind="social", summary_status="irrelevant",
+        )
+
+        body = json.loads(lf.handler(_event({"kind": "social"}), None)["body"])
+        assert [a["article_hash"] for a in body["items"]] == ["keep"]
+
+    def test_company_feed_excludes_irrelevant(self, table):
+        _put_company_item(table, article_hash="keep", company="Bosch", published_at="2026-08-05")
+        _put_company_item(
+            table, article_hash="drop", company="Bosch", published_at="2026-08-06",
+            summary_status="irrelevant",
+        )
+
+        body = json.loads(lf.handler(_event({"company": "Bosch", "from": "2026-08-01"}), None)["body"])
+        assert [a["article_hash"] for a in body["items"]] == ["keep"]
+
+    def test_missing_summary_status_still_shown(self, table):
+        # Predates the field entirely (no key at all, not an empty one) —
+        # _NOT_IRRELEVANT's not_exists() clause must keep these, since a
+        # bare .ne("irrelevant") alone would filter them out too (DynamoDB
+        # treats a comparison against a missing attribute as non-matching).
+        table.put_item(Item={
+            "pk": "ARTICLE#no-status", "sk": "METADATA", "article_hash": "no-status",
+            "title": "t", "link": "https://example.com/no-status", "published_at": "2026-08-05",
+            "category": "auto", "content_kind": "news", "companies": ["Bosch"],
+            "gsi2pk": "ARTICLE", "gsi2sk": "2026-08-05#no-status",
+        })
+
+        body = json.loads(lf.handler(_event({}), None)["body"])
+        assert [a["article_hash"] for a in body["items"]] == ["no-status"]
+
+    def test_latest_feed_honors_limit_past_dynamodb_prefilter_quirk(self, table):
+        # Interleaved relevant/irrelevant — Limit applies before the
+        # FilterExpression runs, so a naive single Query for limit=3 could
+        # come back with fewer than 3 relevant items even though 5 exist.
+        # This is exactly what _query_paginated's loop exists to prevent.
+        for i in range(5):
+            _put_base_item(table, article_hash=f"keep-{i}", published_at=f"2026-08-{10+i}")
+            _put_base_item(
+                table, article_hash=f"drop-{i}", published_at=f"2026-08-{10+i}",
+                summary_status="irrelevant",
+            )
+
+        body = json.loads(lf.handler(_event({"limit": "3"}), None)["body"])
+        assert len(body["items"]) == 3
+        assert all(a["article_hash"].startswith("keep-") for a in body["items"])
 
 
 class TestHandlerValidation:

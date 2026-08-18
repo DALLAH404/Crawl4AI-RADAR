@@ -70,9 +70,16 @@ async def run_summarize(
                 irrelevant += 1
                 return
 
+            # LLM-rewritten headline replaces the scraped one when the model
+            # produced a usable one; falls back to the original title
+            # otherwise (empty LLM output, or the whole call failing before
+            # this point already returned above).
+            title = result.title or article["title"]
+
             update_article(
                 store,
                 article["article_hash"],
+                title=title,
                 summary=result.summary,
                 competitor_analysis=result.competitor_analysis,
                 event_type=result.event_type,
@@ -86,7 +93,7 @@ async def run_summarize(
                 article_hash=article["article_hash"],
                 source_id=article["source_id"] or "unknown",
                 source_name=article["source_name"] or "",
-                title=article["title"],
+                title=title,
                 url=article["link"] or "",
                 summary=result.summary,
                 competitor_analysis=result.competitor_analysis,

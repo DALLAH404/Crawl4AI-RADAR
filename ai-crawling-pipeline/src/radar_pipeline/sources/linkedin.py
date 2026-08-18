@@ -64,7 +64,13 @@ UNIT_DAYS = {
     "y": 365,
 }
 
-_TITLE_MAX_CHARS = 120
+# Bounds only pathological single-line posts (no line breaks at all) —
+# not meant to shorten an ordinary headline-length first line. Raised from
+# 120 after that cap turned out to cut off completely ordinary post
+# openers mid-sentence with no way for a reader to see the rest, since the
+# frontend only ever receives this already-truncated title, never the
+# full post text.
+_TITLE_MAX_CHARS = 280
 
 
 class LinkedInBlockedError(RuntimeError):

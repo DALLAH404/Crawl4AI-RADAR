@@ -12,6 +12,12 @@ export interface Article {
   link: string;
   image_url: string;
   summary: string;
+  // Full scraped post text — only meaningfully "full" for social (LinkedIn)
+  // sources; for news sources it's just a short snippet, no more complete
+  // than `summary`. May be missing/empty on older articles reached via a
+  // company filter (read-api/lambda_function.py's _public_article comment
+  // has the why).
+  action_description: string;
   competitor_analysis: string;
   category: string;
   content_kind: ContentKind;

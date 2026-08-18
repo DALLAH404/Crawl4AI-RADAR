@@ -55,6 +55,11 @@ sources:
     product_line: "Geral"
     category: auto
     rss_url: "https://www.mercadoautomotivo.com.br/feed/"
+    # Disabled 2026-08-18 — origin server returning HTTP 522 (Cloudflare
+    # connection-timeout) on every run, not a transient blip. Re-enable
+    # (drop this line) once https://www.mercadoautomotivo.com.br/feed/
+    # loads again in a browser.
+    active: false
 
   - name: "Revista O Mecânico"
     source_type: portal

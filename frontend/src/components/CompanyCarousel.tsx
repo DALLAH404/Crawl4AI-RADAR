@@ -1,9 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import Link from "next/link";
 import type { Article } from "@/lib/types";
 import { companyColor } from "@/lib/companyColor";
+import { stashArticle } from "@/lib/articleCache";
+import { cleanScrapedText } from "@/lib/cleanScrapedText";
 import { CompanyLogoFallback } from "./CompanyLogoFallback";
 import { RelativeTime } from "./RelativeTime";
 
@@ -20,6 +23,7 @@ export function CompanyCarousel({
   highlights: { company: string; article: Article }[];
 }) {
   const [index, setIndex] = useState(0);
+  const router = useRouter();
 
   useEffect(() => {
     if (highlights.length <= 1) return;
@@ -34,15 +38,19 @@ export function CompanyCarousel({
   const { company, article } = highlights[index];
   const { light, dark } = companyColor(company);
 
+  function openArticle() {
+    stashArticle(article);
+    router.push(`/article/${encodeURIComponent(article.article_hash)}`);
+  }
+
   return (
     <div className="border-b border-border bg-muted/30">
       <div className="mx-auto flex max-w-6xl flex-col gap-6 px-4 py-10 sm:flex-row sm:items-center">
-        <Link
+        <button
           key={`${article.article_hash}-image`}
-          href={article.link}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="relative aspect-[16/9] w-full shrink-0 overflow-hidden rounded-2xl bg-muted [animation:carousel-fade-in_0.4s_ease-out] sm:w-[28rem]"
+          type="button"
+          onClick={openArticle}
+          className="relative aspect-[16/9] w-full shrink-0 cursor-pointer overflow-hidden rounded-2xl bg-muted text-left [animation:carousel-fade-in_0.4s_ease-out] sm:w-[28rem]"
         >
           {article.image_url ? (
             // eslint-disable-next-line @next/next/no-img-element -- external, unpredictable source hosts
@@ -52,7 +60,7 @@ export function CompanyCarousel({
           )}
           <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-teal-500/25 via-transparent to-orange-500/25 mix-blend-overlay" />
           <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/20 to-transparent" />
-        </Link>
+        </button>
 
         <div
           key={`${article.article_hash}-text`}
@@ -66,14 +74,13 @@ export function CompanyCarousel({
             <span className="hidden size-2 rounded-full dark:inline-block" style={{ backgroundColor: dark }} aria-hidden="true" />
             {company}
           </Link>
-          <Link
-            href={article.link}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="font-serif text-2xl font-semibold leading-snug text-foreground hover:text-primary sm:text-3xl"
+          <button
+            type="button"
+            onClick={openArticle}
+            className="cursor-pointer text-left font-serif text-2xl font-semibold leading-snug text-foreground hover:text-primary sm:text-3xl"
           >
-            {article.title}
-          </Link>
+            {cleanScrapedText(article.title)}
+          </button>
           {article.summary && (
             <p className="line-clamp-2 max-w-xl text-sm text-muted-foreground sm:text-base">
               {article.summary}

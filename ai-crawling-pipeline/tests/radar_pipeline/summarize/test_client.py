@@ -57,6 +57,7 @@ def _patch_client(next_content: str):
 VALID_PAYLOAD = (
     '{"summary": "Bosch launches brake pads.", '
     '"competitor_analysis": "Pressure on prices.", '
+    '"title": "Bosch launches new brake pad line", '
     '"event_type": "Lancamento", '
     '"alert_level": "Alto", '
     '"relevant": true}'
@@ -81,6 +82,7 @@ class TestSummarizeOneHappyPath:
         assert result.ok is True
         assert result.summary == "Bosch launches brake pads."
         assert result.competitor_analysis == "Pressure on prices."
+        assert result.title == "Bosch launches new brake pad line"
         assert result.event_type == "Lancamento"
         assert result.alert_level == "Alto"
         assert result.relevant is True
@@ -162,3 +164,13 @@ class TestSummarizeOneCoercions:
         result, _ = await _call("```json\n" + VALID_PAYLOAD + "\n```")
         assert result.ok is True
         assert result.summary == "Bosch launches brake pads."
+
+    async def test_missing_title_defaults_to_empty(self):
+        payload = (
+            '{"summary": "x", "competitor_analysis": "", '
+            '"event_type": "Atualizacao", "alert_level": "Baixo", '
+            '"relevant": true}'
+        )
+        result, _ = await _call(payload)
+        assert result.ok is True
+        assert result.title == ""

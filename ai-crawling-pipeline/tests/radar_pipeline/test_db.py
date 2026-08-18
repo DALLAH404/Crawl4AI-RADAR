@@ -144,6 +144,27 @@ class TestArticles:
         pending = pending_articles(store)
         assert len(pending) == 3
 
+    def test_pending_articles_includes_tecnologia_category(self, store):
+        put_article(store, _make_article(
+            article_hash="tech1", link="https://example.com/tech1",
+            category="tecnologia",
+        ))
+        put_article(store, _make_article(
+            article_hash="auto1", link="https://example.com/auto1",
+            category="auto",
+        ))
+
+        pending = pending_articles(store)
+        assert {a["article_hash"] for a in pending} == {"tech1", "auto1"}
+
+    def test_pending_articles_excludes_unknown_category(self, store):
+        put_article(store, _make_article(
+            article_hash="other1", link="https://example.com/other1",
+            category="something-else",
+        ))
+
+        assert pending_articles(store) == []
+
     def test_pending_articles_includes_feed_type(self, store):
         put_article(store, _make_article(article_hash="with-feed-type", link="https://example.com/ft"))
 

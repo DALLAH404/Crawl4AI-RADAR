@@ -14,6 +14,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "aftermarket. Summarize the article in a single paragraph (max 900 chars) "
     "and assess its competitive relevance.\n"
     "Your response must be valid JSON with these keys exactly:\n"
+    '  "title": a clear, user-friendly headline (max 120 characters) that a '
+    "reader can understand on its own — rewrite it if the original title is "
+    "truncated, a raw social-media caption, or otherwise unclear; keep it as "
+    "close to the original as possible if it's already clear. Must be "
+    "grounded in the article's own content, not invented. Empty string if "
+    "you cannot produce one.\n"
     '  "summary": concise paragraph in English capturing the key business event '
     "and its relevance to the automotive aftermarket.\n"
     '  "competitor_analysis": if the article mentions a specific competitor '

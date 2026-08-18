@@ -130,6 +130,10 @@ class SummarizeResult:
     ok: bool
     summary: str = ""
     competitor_analysis: str = ""
+    # LLM-rewritten headline, empty when the model didn't produce a usable
+    # one — the caller (summarize/pipeline.py) falls back to the article's
+    # original scraped title in that case, never overwriting with "".
+    title: str = ""
     event_type: str = ""
     alert_level: str = ""
     relevant: bool = True

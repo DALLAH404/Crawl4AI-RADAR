@@ -169,9 +169,9 @@ class TestItemMapping:
         assert _post_title("Bosch launches a new line.\nMore text here.") == "Bosch launches a new line."
 
     def test_title_truncates_long_first_line(self):
-        long_line = "word " * 40
+        long_line = "word " * 60
         title = _post_title(long_line.strip())
-        assert len(title) <= 121
+        assert len(title) <= 281
         assert title.endswith("…")
 
     def test_title_empty_for_media_only_post(self):

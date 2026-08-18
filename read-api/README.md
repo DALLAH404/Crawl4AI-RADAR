@@ -42,15 +42,21 @@ the DynamoDB schema in `ai-crawling-pipeline/src/radar_pipeline/README.md`'s
   and merges the results by `published_at`, deduping any article linked to more
   than one of the selected companies. When `kind` is also given, each company's
   Query is filtered by `content_kind` — a `FilterExpression`, not a second
-  dedicated index, since one company's results are already narrow. That filter
-  interacts with DynamoDB's `Limit` in a way worth knowing about: `Limit` applies
-  to items *evaluated*, before the filter runs, so a naive single query can come
-  back with fewer than `limit` matches even when more exist — `_query_one_company`
-  loops on the pagination cursor until it actually collects `limit` matches or runs
-  out of that company's results, rather than under-returning. Pagination for the
-  no-`company`, `kind`-only case (like the plain latest-overall case) is exact, not
-  approximate — only the multi-company fan-out case has the "carries a cursor per
-  company" approximation described next.
+  dedicated index, since one company's results are already narrow.
+
+All three query patterns also filter out `summary_status='irrelevant'` articles
+(`_NOT_IRRELEVANT` in `lambda_function.py`) — the LLM's own relevance verdict
+(`summarize/pipeline.py`'s `mark_article_irrelevant`) never removes an article
+from any index, it just flags it, so every read path here has to exclude it
+itself. That filter — like the `content_kind` one above — interacts with
+DynamoDB's `Limit` in a way worth knowing about: `Limit` applies to items
+*evaluated*, before any `FilterExpression` runs, so a naive single query can
+come back with fewer than `limit` matches even when more exist. `_query_paginated`
+(the plain latest/kind-only paths) and `_query_one_company` (the company path)
+both loop on the pagination cursor until they actually collect `limit` matches
+or run out of results, rather than under-returning — so pagination stays exact,
+not approximate, in all three cases. Only the multi-company fan-out has the
+"carries a cursor per company" approximation described next.
 
   Pagination across multiple companies is *approximate*, not exact — each page
   re-queries every selected company and re-merges, carrying a cursor per company

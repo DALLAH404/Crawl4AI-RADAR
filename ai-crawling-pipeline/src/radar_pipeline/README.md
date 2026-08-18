@@ -163,8 +163,8 @@ otherwise to local disk at `outputs/radar/raw/<source_id>/<source_id>_<hash8>.md
 
 - **Pending source** — `pending_articles(store)` queries the `PendingIndex` GSI
   (sparse: only items with `summary_status = 'pending'`) and filters to
-  `category IN ('auto','economia') AND (dedup_decision NOT EXISTS OR dedup_decision
-  != 'duplicate')`. `feed_type` (needed to route LinkedIn rows below) is denormalized
+  `category IN ('auto','economia','tecnologia') AND (dedup_decision NOT EXISTS OR
+  dedup_decision != 'duplicate')`. `feed_type` (needed to route LinkedIn rows below) is denormalized
   onto the article itself at collect time — see [Sources](#sources) — rather than
   joined from a sources table, since DynamoDB has no join. (See
   [Dedup below](#3-dedup--deduplayerspy) for why duplicates are excluded.)
@@ -296,14 +296,18 @@ Calls an OpenAI-compatible LLM (default `deepseek-v4-flash` via a custom
 `base_url`) for every *new* (non-duplicate) pending article and writes two
 artefacts:
 
-1. **DynamoDB update** — `update_article(store, article_hash, ...)` sets `summary`,
-   `competitor_analysis`, `event_type`, `alert_level`,
+1. **DynamoDB update** — `update_article(store, article_hash, ...)` sets `title`,
+   `summary`, `competitor_analysis`, `event_type`, `alert_level`,
    `summary_status='ai_generated'`, `ai_model`, `ai_processed_at` on the base item
    (and its company-link items — see [Database layer](#database-layer--dbpy)).
+   `title` is only overwritten when the LLM produced a usable rewrite; a scraped
+   title (still the original, e.g. a LinkedIn post truncated to its first line —
+   see `sources/linkedin.py`) is left as-is, never replaced with an empty string.
 2. **JSON file** — `summarize/writer.write_summary_json` writes
    `outputs/radar/processed/<source_id>/<source_id>_<hash8>.json`
-   containing a flat object with article metadata and the title, summary,
-   competitor analysis, event_type, and alert_level.
+   containing a flat object with article metadata and the (possibly
+   LLM-rewritten) title, summary, competitor analysis, event_type, and
+   alert_level.
 
 Behaviour:
 
@@ -319,7 +323,9 @@ Behaviour:
   with exponential backoff (`1s, 2s, 4s`) on `APIError` / `APIConnectionError`.
   Other exceptions return `SummarizeResult(ok=False)` immediately.
 - **JSON parsing** — the LLM is expected to return a JSON object with keys
-  `summary, competitor_analysis, event_type, alert_level, relevant`. If parsing
+  `title, summary, competitor_analysis, event_type, alert_level, relevant`.
+  `title` is optional (empty string is valid and means "keep the original");
+  `summary` is the only key whose absence is a hard failure. If parsing
   fails, the code falls back to a `re.search(r"\{.*\}")` to extract a JSON
   fragment; if that also fails, the raw text (first 900 chars) is used as the
   summary with `relevant=True` (graceful degradation).
@@ -608,8 +614,8 @@ dedup→summarize handshake still uses two independent fields:
 
 `pending_articles` filters on both — via the sparse `PendingIndex` GSI (only items
 with `summary_status='pending'` are in it at all) plus a `FilterExpression` for
-`category IN ('auto','economia') AND (dedup_decision NOT EXISTS OR dedup_decision !=
-'duplicate')`. DynamoDB has no CHECK constraint to enforce the separation the way
+`category IN ('auto','economia','tecnologia') AND (dedup_decision NOT EXISTS OR
+dedup_decision != 'duplicate')`. DynamoDB has no CHECK constraint to enforce the separation the way
 SQLite did, so this now relies entirely on the application code never conflating the
 two — worth remembering before adding a third status-like field.
 

@@ -108,6 +108,7 @@ class TestNormalizeSummaryDict:
         assert out == {
             "summary": "Bosch launches new brake pads.",
             "competitor_analysis": "Pressure on aftermarket pricing.",
+            "title": "",
             "event_type": "Lancamento",
             "alert_level": "Alto",
             "relevant": True,
@@ -156,3 +157,23 @@ class TestNormalizeSummaryDict:
             self._full_payload(competitor_analysis=["a", "b"])
         )
         assert out["competitor_analysis"] == ""
+
+    def test_title_passes_through(self):
+        out = normalize_summary_dict(self._full_payload(title="Bosch launches brake pads for aftermarket"))
+        assert out["title"] == "Bosch launches brake pads for aftermarket"
+
+    def test_title_truncated(self):
+        out = normalize_summary_dict(self._full_payload(title="x" * 200))
+        assert len(out["title"]) == 120
+
+    def test_title_missing_becomes_empty(self):
+        out = normalize_summary_dict(self._full_payload())
+        assert out["title"] == ""
+
+    def test_blank_title_becomes_empty(self):
+        out = normalize_summary_dict(self._full_payload(title="   "))
+        assert out["title"] == ""
+
+    def test_non_string_title_becomes_empty(self):
+        out = normalize_summary_dict(self._full_payload(title=["a", "b"]))
+        assert out["title"] == ""

@@ -87,9 +87,12 @@ def _public_article(item: dict) -> dict:
     Company-link items (from CompanyTimeIndex) carry a smaller field set
     than base items (from LatestIndex) by design — they're a deliberately
     partial, denormalized view (see the README's "Multi-company reads").
-    Fields absent on a given item just come through as their default here
-    rather than raising — same reasoning as db._as_full_article, applied to
-    a public API response instead of an internal one.
+    `action_description` is now denormalized onto company-link items too
+    (see db.py's _company_item), but older items written before that change
+    won't have it until the article is next updated — Fields absent on a
+    given item just come through as their default here rather than raising,
+    same reasoning as db._as_full_article, applied to a public API response
+    instead of an internal one.
     """
     companies = item.get("companies")
     if companies is None:
@@ -100,6 +103,10 @@ def _public_article(item: dict) -> dict:
         "link": item.get("link", ""),
         "image_url": item.get("image_url", ""),
         "summary": item.get("summary", ""),
+        # Full scraped post text — only meaningfully "full" for social
+        # (LinkedIn) sources; for RSS/news sources this is just a 300-char
+        # snippet (see linkedin.py vs collector.py's action_description).
+        "action_description": item.get("action_description", ""),
         "competitor_analysis": item.get("competitor_analysis", ""),
         "category": item.get("category", ""),
         "content_kind": item.get("content_kind", "news"),
@@ -124,21 +131,62 @@ def _decode_cursor(value: str | None):
     return json.loads(base64.urlsafe_b64decode(value.encode()).decode())
 
 
+# The LLM's own relevance verdict (summarize/pipeline.py's mark_article_irrelevant)
+# — never removes the article from any index, just flags it, so every read
+# path has to filter it out itself. `not_exists()` keeps items that predate
+# this field (there shouldn't be any, but see db.py's pending_articles for
+# the same NOT EXISTS-or-not-equal idiom against a differently-meaning-missing
+# field) from being silently dropped: DynamoDB treats a comparison against a
+# missing attribute as non-matching, not as "unequal", so a bare `.ne()` alone
+# would filter out anything that happens to lack summary_status entirely.
+_NOT_IRRELEVANT = Attr("summary_status").not_exists() | Attr("summary_status").ne("irrelevant")
+
+
+def _query_paginated(
+    table,
+    index_name: str,
+    key_condition,
+    limit: int,
+    start_key: dict | None,
+) -> tuple[list[dict], dict | None]:
+    """One page of a plain (no company fan-out) index query, filtered to
+    non-irrelevant articles.
+
+    DynamoDB's Limit applies to items *evaluated*, before FilterExpression
+    runs — so a single Query can come back with fewer than `limit` matches
+    even though more exist, whenever an irrelevant article falls inside that
+    page's Limit window. Loops on LastEvaluatedKey until either `limit`
+    matches are collected or the index is exhausted, same fix
+    _query_one_company already applies for company-scoped queries.
+    """
+    items: list[dict] = []
+    exclusive_start_key = start_key
+    while True:
+        kwargs: dict[str, Any] = {
+            "IndexName": index_name,
+            "KeyConditionExpression": key_condition,
+            "FilterExpression": _NOT_IRRELEVANT,
+            "ScanIndexForward": False,
+            "Limit": max(limit - len(items), 1),
+        }
+        if exclusive_start_key:
+            kwargs["ExclusiveStartKey"] = exclusive_start_key
+        resp = table.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        exclusive_start_key = resp.get("LastEvaluatedKey")
+        if len(items) >= limit or not exclusive_start_key:
+            break
+    return items[:limit], (exclusive_start_key if len(items) >= limit else None)
+
+
 def _latest_articles(limit: int, cursor: str | None) -> dict:
     table = _table_resource()
-    kwargs: dict[str, Any] = {
-        "IndexName": "LatestIndex",
-        "KeyConditionExpression": Key("gsi2pk").eq("ARTICLE"),
-        "ScanIndexForward": False,
-        "Limit": limit,
-    }
-    start_key = _decode_cursor(cursor)
-    if start_key:
-        kwargs["ExclusiveStartKey"] = start_key
-    resp = table.query(**kwargs)
+    items, last_key = _query_paginated(
+        table, "LatestIndex", Key("gsi2pk").eq("ARTICLE"), limit, _decode_cursor(cursor)
+    )
     return {
-        "items": [_public_article(i) for i in resp.get("Items", [])],
-        "next_cursor": _encode_cursor(resp.get("LastEvaluatedKey")),
+        "items": [_public_article(i) for i in items],
+        "next_cursor": _encode_cursor(last_key),
     }
 
 
@@ -146,19 +194,12 @@ def _articles_by_kind(kind: str, limit: int, cursor: str | None) -> dict:
     """The "one kind, no company" feed — same shape as _latest_articles,
     scoped to KindIndex's gsi5pk instead of LatestIndex's constant one."""
     table = _table_resource()
-    kwargs: dict[str, Any] = {
-        "IndexName": "KindIndex",
-        "KeyConditionExpression": Key("gsi5pk").eq(f"KIND#{kind}"),
-        "ScanIndexForward": False,
-        "Limit": limit,
-    }
-    start_key = _decode_cursor(cursor)
-    if start_key:
-        kwargs["ExclusiveStartKey"] = start_key
-    resp = table.query(**kwargs)
+    items, last_key = _query_paginated(
+        table, "KindIndex", Key("gsi5pk").eq(f"KIND#{kind}"), limit, _decode_cursor(cursor)
+    )
     return {
-        "items": [_public_article(i) for i in resp.get("Items", [])],
-        "next_cursor": _encode_cursor(resp.get("LastEvaluatedKey")),
+        "items": [_public_article(i) for i in items],
+        "next_cursor": _encode_cursor(last_key),
     }
 
 
@@ -171,7 +212,8 @@ def _query_one_company(
     limit: int,
     start_key: dict | None,
 ) -> tuple[list[dict], dict | None]:
-    """One company's items for one page, optionally kind-filtered.
+    """One company's items for one page, optionally kind-filtered, always
+    excluding irrelevant articles (_NOT_IRRELEVANT).
 
     kind filtering uses a FilterExpression against content_kind
     (denormalized onto every company-link item), not a dedicated index —
@@ -199,8 +241,9 @@ def _query_one_company(
         "KeyConditionExpression": key_cond,
         "ScanIndexForward": False,
     }
-    if kind:
-        base_kwargs["FilterExpression"] = Attr("content_kind").eq(kind)
+    base_kwargs["FilterExpression"] = (
+        _NOT_IRRELEVANT & Attr("content_kind").eq(kind) if kind else _NOT_IRRELEVANT
+    )
 
     items: list[dict] = []
     exclusive_start_key = start_key

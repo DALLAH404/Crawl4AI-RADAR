@@ -83,6 +83,7 @@ async def summarize_one(
             ok=True,
             summary=norm["summary"],
             competitor_analysis=norm["competitor_analysis"],
+            title=norm["title"],
             event_type=norm["event_type"],
             alert_level=norm["alert_level"],
             relevant=norm["relevant"],

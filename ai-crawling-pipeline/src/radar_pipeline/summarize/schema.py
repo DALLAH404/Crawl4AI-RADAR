@@ -33,6 +33,7 @@ DEFAULT_ALERT_LEVEL = "Baixo"
 
 MAX_SUMMARY_LEN = 900
 MAX_COMPETITOR_ANALYSIS_LEN = 500
+MAX_TITLE_LEN = 120
 
 _TRUE_STRINGS = {"true", "yes", "1", "y", "t"}
 _FALSE_STRINGS = {"false", "no", "0", "n", "f"}
@@ -118,9 +119,19 @@ def normalize_summary_dict(data: dict[str, Any]) -> dict[str, Any]:
         competitor_analysis = ""
     competitor_analysis = competitor_analysis.strip()[:MAX_COMPETITOR_ANALYSIS_LEN]
 
+    # Optional, unlike summary — an empty string here (not raising) is what
+    # tells the caller (summarize/pipeline.py) to fall back to the article's
+    # original scraped title instead of overwriting it with nothing.
+    title = data.get("title")
+    if not isinstance(title, str) or not title.strip():
+        title = ""
+    else:
+        title = title.strip()[:MAX_TITLE_LEN]
+
     return {
         "summary": summary,
         "competitor_analysis": competitor_analysis,
+        "title": title,
         "event_type": validate_event_type(data.get("event_type")),
         "alert_level": validate_alert_level(data.get("alert_level")),
         "relevant": coerce_relevant(data.get("relevant", True)),
