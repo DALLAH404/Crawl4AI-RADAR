@@ -129,6 +129,15 @@ export function ArticleDetail({ hash }: { hash: string }) {
         <p className="text-base leading-relaxed text-muted-foreground">{displayText}</p>
       )}
 
+      {article.competitor_analysis && (
+        <div className="rounded-lg border border-border bg-muted/50 p-3">
+          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Remark
+          </p>
+          <p className="text-sm leading-relaxed text-foreground">{article.competitor_analysis}</p>
+        </div>
+      )}
+
       {article.companies.length > 0 && (
         <div className="flex flex-wrap gap-1.5">
           {article.companies.map((name) => (
