@@ -51,3 +51,9 @@ export function toggleBookmark(article: Article): boolean {
   window.dispatchEvent(new Event(BOOKMARKS_CHANGED_EVENT));
   return !exists;
 }
+
+export function clearBookmarks(): void {
+  localStorage.removeItem(BOOKMARKS_KEY);
+  cache = [];
+  window.dispatchEvent(new Event(BOOKMARKS_CHANGED_EVENT));
+}

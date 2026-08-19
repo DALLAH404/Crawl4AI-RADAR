@@ -1,7 +1,7 @@
 "use client";
 
 import { useSyncExternalStore } from "react";
-import { BOOKMARKS_CHANGED_EVENT, getBookmarks } from "@/lib/bookmarks";
+import { BOOKMARKS_CHANGED_EVENT, clearBookmarks, getBookmarks } from "@/lib/bookmarks";
 import { ArticleCard } from "./ArticleCard";
 
 // useSyncExternalStore rather than useState+useEffect (see BookmarkButton's
@@ -39,10 +39,25 @@ export function BookmarksList() {
   }
 
   return (
-    <div className="grid gap-4 sm:grid-cols-2">
-      {bookmarks.map((article) => (
-        <ArticleCard key={article.article_hash} article={article} />
-      ))}
+    <div className="flex flex-col gap-4">
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={() => {
+            if (window.confirm("Remove all bookmarks? This can't be undone.")) {
+              clearBookmarks();
+            }
+          }}
+          className="text-sm text-muted-foreground hover:text-foreground"
+        >
+          Clear all
+        </button>
+      </div>
+      <div className="grid gap-4 sm:grid-cols-2">
+        {bookmarks.map((article) => (
+          <ArticleCard key={article.article_hash} article={article} />
+        ))}
+      </div>
     </div>
   );
 }
