@@ -34,6 +34,9 @@ export function DateRangeCalendar() {
     else params.delete("from");
     if (nextTo) params.set("to", nextTo);
     else params.delete("to");
+    // See KindFilter's comment — a cursor from a different filter
+    // combination is an invalid ExclusiveStartKey for this one.
+    params.delete("cursor");
     router.push(`${pathname}${params.size ? `?${params}` : ""}`, { scroll: false });
   }
 

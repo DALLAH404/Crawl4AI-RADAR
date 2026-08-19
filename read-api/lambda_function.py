@@ -141,6 +141,19 @@ def _decode_cursor(value: str | None):
 # would filter out anything that happens to lack summary_status entirely.
 _NOT_IRRELEVANT = Attr("summary_status").not_exists() | Attr("summary_status").ne("irrelevant")
 
+# dedup's own verdict (dedup/layers.py, via mark_article_duplicate) — same
+# story as _NOT_IRRELEVANT, a different field entirely (summary_status and
+# dedup_decision are deliberately independent, see radar_pipeline/README.md's
+# "summary_status / dedup_decision independence"), so it needs its own
+# exclusion here too. Two articles for the literal same story can land at
+# different article_hashes (different URLs — e.g. a publisher exposing the
+# same article at both /noticias/<slug> and /noticias/categoria/x/<slug>) and
+# still get caught by dedup's title-hash layer; without this, that duplicate
+# stayed fully visible on every index regardless.
+_NOT_DUPLICATE = Attr("dedup_decision").not_exists() | Attr("dedup_decision").ne("duplicate")
+
+_PUBLIC_ONLY = _NOT_IRRELEVANT & _NOT_DUPLICATE
+
 
 def _query_paginated(
     table,
@@ -165,7 +178,7 @@ def _query_paginated(
         kwargs: dict[str, Any] = {
             "IndexName": index_name,
             "KeyConditionExpression": key_condition,
-            "FilterExpression": _NOT_IRRELEVANT,
+            "FilterExpression": _PUBLIC_ONLY,
             "ScanIndexForward": False,
             "Limit": max(limit - len(items), 1),
         }
@@ -213,7 +226,7 @@ def _query_one_company(
     start_key: dict | None,
 ) -> tuple[list[dict], dict | None]:
     """One company's items for one page, optionally kind-filtered, always
-    excluding irrelevant articles (_NOT_IRRELEVANT).
+    excluding irrelevant/duplicate articles (_PUBLIC_ONLY).
 
     kind filtering uses a FilterExpression against content_kind
     (denormalized onto every company-link item), not a dedicated index —
@@ -242,7 +255,7 @@ def _query_one_company(
         "ScanIndexForward": False,
     }
     base_kwargs["FilterExpression"] = (
-        _NOT_IRRELEVANT & Attr("content_kind").eq(kind) if kind else _NOT_IRRELEVANT
+        _PUBLIC_ONLY & Attr("content_kind").eq(kind) if kind else _PUBLIC_ONLY
     )
 
     items: list[dict] = []

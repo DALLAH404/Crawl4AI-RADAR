@@ -14,9 +14,9 @@ function subscribe(callback: () => void) {
   return () => window.removeEventListener(BOOKMARKS_CHANGED_EVENT, callback);
 }
 
-// Sits inside a clickable card (see ArticleCard/CompanyHighlightCard), so
-// its own click must not also trigger the card's onClick (opening the
-// article modal) — stopPropagation, same pattern as the company badges.
+// Sits inside a clickable card (see ArticleCard), so its own click must not
+// also trigger the card's onClick (navigating to the article page) —
+// stopPropagation, same pattern as the company badges.
 export function BookmarkButton({ article, size = "md" }: { article: Article; size?: "sm" | "md" }) {
   const saved = useSyncExternalStore(
     subscribe,

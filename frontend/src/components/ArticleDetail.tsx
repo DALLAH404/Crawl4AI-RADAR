@@ -2,11 +2,13 @@
 
 import { useSyncExternalStore } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import type { Article } from "@/lib/types";
 import { getBookmarks } from "@/lib/bookmarks";
 import { getStashedArticle } from "@/lib/articleCache";
 import { cleanScrapedText } from "@/lib/cleanScrapedText";
 import { AlertBadge } from "./AlertBadge";
+import { BookmarkButton } from "./BookmarkButton";
 import { CompanyBadge } from "./CompanyBadge";
 import { CompanyLogoFallback } from "./CompanyLogoFallback";
 import { RelativeTime } from "./RelativeTime";
@@ -29,6 +31,7 @@ function useHasMounted() {
 // to a bookmarked copy (durable across sessions) for direct/refreshed visits
 // to an article that happens to be saved, and a not-found state otherwise.
 export function ArticleDetail({ hash }: { hash: string }) {
+  const router = useRouter();
   const mounted = useHasMounted();
 
   if (!mounted) {
@@ -73,9 +76,16 @@ export function ArticleDetail({ hash }: { hash: string }) {
 
   return (
     <article className="flex flex-col gap-4">
-      <Link href="/" className="text-sm text-muted-foreground hover:text-foreground">
-        ← Back to feed
-      </Link>
+      <div className="flex items-center justify-between">
+        <button
+          type="button"
+          onClick={() => router.back()}
+          className="text-sm text-muted-foreground hover:text-foreground"
+        >
+          ← Back to feed
+        </button>
+        <BookmarkButton article={article} />
+      </div>
 
       {(article.image_url || article.companies[0]) && (
         <div className="aspect-[16/9] w-full overflow-hidden rounded-xl bg-muted">

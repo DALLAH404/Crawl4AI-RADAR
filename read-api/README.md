@@ -44,11 +44,19 @@ the DynamoDB schema in `ai-crawling-pipeline/src/radar_pipeline/README.md`'s
   Query is filtered by `content_kind` — a `FilterExpression`, not a second
   dedicated index, since one company's results are already narrow.
 
-All three query patterns also filter out `summary_status='irrelevant'` articles
-(`_NOT_IRRELEVANT` in `lambda_function.py`) — the LLM's own relevance verdict
-(`summarize/pipeline.py`'s `mark_article_irrelevant`) never removes an article
-from any index, it just flags it, so every read path here has to exclude it
-itself. That filter — like the `content_kind` one above — interacts with
+All three query patterns also filter out `summary_status='irrelevant'` and
+`dedup_decision='duplicate'` articles (`_PUBLIC_ONLY` in `lambda_function.py`,
+combining `_NOT_IRRELEVANT` and `_NOT_DUPLICATE`) — neither the LLM's relevance
+verdict (`summarize/pipeline.py`'s `mark_article_irrelevant`) nor dedup's own
+verdict (`dedup/layers.py`) ever removes an article from any index, they just
+flag it (on two deliberately independent fields — see
+`radar_pipeline/README.md`'s "summary_status / dedup_decision independence"),
+so every read path here has to exclude both itself. `dedup_decision` isn't
+denormalized onto company-link items the same way `action_description` is —
+see `db.py`'s `_company_item` — so a company-filtered read only excludes
+duplicates written after that field was added; older company-link items
+predate it and won't be excluded until the article is next rewritten. These
+filters — like the `content_kind` one above — interact with
 DynamoDB's `Limit` in a way worth knowing about: `Limit` applies to items
 *evaluated*, before any `FilterExpression` runs, so a naive single query can
 come back with fewer than `limit` matches even when more exist. `_query_paginated`

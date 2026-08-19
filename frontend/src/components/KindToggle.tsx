@@ -23,6 +23,9 @@ export function KindToggle() {
     } else {
       params.delete("kind");
     }
+    // See KindFilter's comment — a cursor from a different filter
+    // combination is an invalid ExclusiveStartKey for this one.
+    params.delete("cursor");
     router.push(`${pathname}${params.size ? `?${params}` : ""}`, { scroll: false });
   }
 

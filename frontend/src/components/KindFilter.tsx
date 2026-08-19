@@ -23,6 +23,12 @@ export function KindFilter() {
     const params = new URLSearchParams(searchParams.toString());
     if (value) params.set("kind", value);
     else params.delete("kind");
+    // A cursor encodes a pagination position for one specific query shape
+    // (which index, which filters) — carrying it into a different filter
+    // combination sends DynamoDB an ExclusiveStartKey that doesn't match
+    // the index actually being queried, which the read API can't recover
+    // from (500, not just wrong results).
+    params.delete("cursor");
     router.push(`${pathname}${params.size ? `?${params}` : ""}`, { scroll: false });
   }
 

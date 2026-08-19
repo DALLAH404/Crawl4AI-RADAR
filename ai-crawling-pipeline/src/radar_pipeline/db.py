@@ -312,6 +312,10 @@ def _company_item(article: Article, tag: str) -> dict:
         # optional kind filter (a FilterExpression against CompanyTimeIndex,
         # not a dedicated index; see that function's docstring for why).
         "content_kind": article.content_kind,
+        # Denormalized so the read API can exclude dedup'd-away articles from
+        # company-filtered reads too, not just the base-item ones — same
+        # reasoning as action_description above.
+        "dedup_decision": article.dedup_decision,
     }
     return {k: v for k, v in item.items() if v not in (None, "")}
 

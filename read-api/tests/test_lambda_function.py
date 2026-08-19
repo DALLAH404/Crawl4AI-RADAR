@@ -329,6 +329,81 @@ class TestIrrelevantFiltering:
         assert all(a["article_hash"].startswith("keep-") for a in body["items"])
 
 
+class TestDuplicateFiltering:
+    def test_latest_feed_excludes_duplicates(self, table):
+        _put_base_item(table, article_hash="keep", published_at="2026-08-05")
+        _put_base_item(table, article_hash="drop", published_at="2026-08-06", dedup_decision="duplicate")
+
+        body = json.loads(lf.handler(_event({}), None)["body"])
+        assert [a["article_hash"] for a in body["items"]] == ["keep"]
+
+    def test_kind_feed_excludes_duplicates(self, table):
+        _put_base_item(table, article_hash="keep", published_at="2026-08-05", content_kind="social")
+        _put_base_item(
+            table, article_hash="drop", published_at="2026-08-06",
+            content_kind="social", dedup_decision="duplicate",
+        )
+
+        body = json.loads(lf.handler(_event({"kind": "social"}), None)["body"])
+        assert [a["article_hash"] for a in body["items"]] == ["keep"]
+
+    def test_company_feed_excludes_duplicates(self, table):
+        _put_company_item(table, article_hash="keep", company="Bosch", published_at="2026-08-05")
+        _put_company_item(
+            table, article_hash="drop", company="Bosch", published_at="2026-08-06",
+            dedup_decision="duplicate",
+        )
+
+        body = json.loads(lf.handler(_event({"company": "Bosch", "from": "2026-08-01"}), None)["body"])
+        assert [a["article_hash"] for a in body["items"]] == ["keep"]
+
+    def test_missing_dedup_decision_still_shown(self, table):
+        table.put_item(Item={
+            "pk": "ARTICLE#no-decision", "sk": "METADATA", "article_hash": "no-decision",
+            "title": "t", "link": "https://example.com/no-decision", "published_at": "2026-08-05",
+            "category": "auto", "content_kind": "news", "companies": ["Bosch"],
+            "gsi2pk": "ARTICLE", "gsi2sk": "2026-08-05#no-decision",
+        })
+
+        body = json.loads(lf.handler(_event({}), None)["body"])
+        assert [a["article_hash"] for a in body["items"]] == ["no-decision"]
+
+    def test_two_urls_for_the_same_story_one_flagged_duplicate(self, table):
+        # Regression: the actual bug — a publisher exposing the same article
+        # at two URLs (e.g. /noticias/<slug> and /noticias/categoria/x/<slug>)
+        # produces two different article_hashes (md5 of the URL), but dedup's
+        # title-hash layer still catches it and flags one dedup_decision=
+        # 'duplicate' — which must disappear from every public read, not just
+        # stay silently visible because it's a different field from
+        # summary_status.
+        _put_base_item(
+            table, article_hash="agrolink-a", published_at="2026-08-18T09:27:00+00:00",
+            title="Inflação desacelera e atividade econômica perde ritmo - Agrolink",
+            link="https://www.agrolink.com.br/noticias/inflacao-desacelera_517897.html",
+        )
+        _put_base_item(
+            table, article_hash="agrolink-b", published_at="2026-08-18T09:27:00+00:00",
+            title="Inflação desacelera e atividade econômica perde ritmo - Agrolink",
+            link="https://www.agrolink.com.br/noticias/categoria/economia/inflacao-desacelera_517897.html",
+            dedup_decision="duplicate",
+        )
+
+        body = json.loads(lf.handler(_event({}), None)["body"])
+        assert [a["article_hash"] for a in body["items"]] == ["agrolink-a"]
+
+    def test_latest_feed_honors_limit_past_dynamodb_prefilter_quirk_for_duplicates(self, table):
+        for i in range(5):
+            _put_base_item(table, article_hash=f"keep-{i}", published_at=f"2026-08-{10+i}")
+            _put_base_item(
+                table, article_hash=f"drop-{i}", published_at=f"2026-08-{10+i}",
+                dedup_decision="duplicate",
+            )
+
+        body = json.loads(lf.handler(_event({"limit": "3"}), None)["body"])
+        assert len(body["items"]) == 3
+        assert all(a["article_hash"].startswith("keep-") for a in body["items"])
+
+
 class TestHandlerValidation:
     def test_options_request_is_ok_with_no_body_work(self, table):
         resp = lf.handler(_event({}, method="OPTIONS"), None)

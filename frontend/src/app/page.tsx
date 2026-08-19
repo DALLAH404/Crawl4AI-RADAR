@@ -3,11 +3,12 @@ import { Hero } from "@/components/Hero";
 import { MenuBar } from "@/components/MenuBar";
 import { StockTicker } from "@/components/StockTicker";
 import { CompanyCarousel } from "@/components/CompanyCarousel";
-import { CompanyHighlightCard } from "@/components/CompanyHighlightCard";
+import { ArticleFeed } from "@/components/ArticleFeed";
 import { FilterSidebar } from "@/components/FilterSidebar";
 import type { Article, ContentKind } from "@/lib/types";
 
 const CAROUSEL_SIZE = 8;
+const PAGE_SIZE = 24;
 
 function parseKind(value: string | string[] | undefined): ContentKind | undefined {
   const raw = Array.isArray(value) ? value[0] : value;
@@ -26,6 +27,11 @@ function parseDate(value: string | string[] | undefined): string | undefined {
   return raw || undefined;
 }
 
+function parseCursor(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return raw || undefined;
+}
+
 // The read API's own from/to only take effect in per-company query mode
 // (see read-api/README.md), so date filtering is done here instead, against
 // whatever's already been fetched — that way it works the same whether or
@@ -39,43 +45,18 @@ function withinRange(publishedAt: string, from: string | undefined, to: string |
   return true;
 }
 
-// Two different jobs depending on whether a company filter is active:
-//
-// - No company selected: one highlight per company, its single newest
-//   article — a broad "most active right now" overview. There's no "list
-//   all companies with activity" endpoint, so this pulls a wide window of
-//   the latest-overall feed and takes each company's first (= newest,
-//   since the feed is already recency-sorted) in-range appearance —
-//   companies whose last mention falls outside that window just won't have
-//   a card, the right tradeoff against firing one API call per tracked
-//   company on every homepage load. Order is "most recently active first",
-//   which the carousel relies on.
-// - Specific companies selected: every matching article for each, not just
-//   the newest — once you've deliberately picked a company, seeing only
-//   its single latest post instead of everything in the selected
-//   timeframe/kind is surprising, not a highlight.
-async function getCompanyHighlights(
-  company: string[] | undefined,
-  kind: ContentKind | undefined,
-  from: string | undefined,
-  to: string | undefined,
-): Promise<{ company: string; article: Article }[]> {
-  if (company?.length) {
-    const results = await Promise.all(
-      company.map(async (name) => {
-        const { items } = await getArticles({ company: [name], kind, from, to, limit: 30 });
-        return items
-          .filter((article) => withinRange(article.published_at, from, to))
-          .map((article) => ({ company: name, article }));
-      }),
-    );
-    return results.flat();
-  }
-
-  const { items } = await getArticles({ kind, limit: 100 });
+// The carousel's own data, independent of the grid below and of any of the
+// page's filters — a fixed "most active right now" spotlight, one highlight
+// per company (its single newest article). There's no "list all companies
+// with activity" endpoint, so this pulls a wide window of the latest-overall
+// feed and takes each company's first (= newest, since the feed is already
+// recency-sorted) appearance — companies whose last mention falls outside
+// that window just won't have a spot, the right tradeoff against firing one
+// API call per tracked company on every homepage load.
+async function getCarouselHighlights(): Promise<{ company: string; article: Article }[]> {
+  const { items } = await getArticles({ limit: 100 });
   const newestByCompany = new Map<string, Article>();
   for (const article of items) {
-    if (!withinRange(article.published_at, from, to)) continue;
     for (const name of article.companies) {
       if (!newestByCompany.has(name)) {
         newestByCompany.set(name, article);
@@ -85,59 +66,79 @@ async function getCompanyHighlights(
   return [...newestByCompany.entries()].map(([company, article]) => ({ company, article }));
 }
 
+// The main feed: every article across every company, newest first — not
+// deduped down to one per company (that's the carousel's job above).
+async function getFeed(
+  company: string[] | undefined,
+  kind: ContentKind | undefined,
+  from: string | undefined,
+  to: string | undefined,
+  cursor: string | undefined,
+): Promise<{ items: Article[]; nextCursor: string | null }> {
+  if (company?.length) {
+    // One Query per company (CompanyTimeIndex can't take more than one
+    // partition key at a time), merged back into a single newest-first
+    // list — each company's own results already come back newest-first,
+    // but the merge itself doesn't preserve that across companies without
+    // this sort.
+    const results = await Promise.all(
+      company.map((name) => getArticles({ company: [name], kind, from, to, limit: PAGE_SIZE })),
+    );
+    const items = results
+      .flatMap((r) => r.items)
+      .filter((article) => withinRange(article.published_at, from, to))
+      .sort((a, b) => (a.published_at > b.published_at ? -1 : 1));
+    // Multi-company reads are already an approximate, per-company-cursor
+    // pagination on the read API's side (read-api/README.md) — not
+    // layering a second "Load more" on top of that here.
+    return { items, nextCursor: null };
+  }
+
+  if (from || to) {
+    // Same reasoning as withinRange's own comment: filters client-side
+    // against one wider fetch instead of relying on the API. A cursor
+    // wouldn't paginate cleanly on top of a client-side filter — a page
+    // could come back empty while more matches exist further back — so
+    // no "Load more" for this case either.
+    const { items } = await getArticles({ kind, limit: 100 });
+    return { items: items.filter((a) => withinRange(a.published_at, from, to)), nextCursor: null };
+  }
+
+  const { items, next_cursor } = await getArticles({ kind, limit: PAGE_SIZE, cursor });
+  return { items, nextCursor: next_cursor };
+}
+
 export default async function Home({ searchParams }: PageProps<"/">) {
   const params = await searchParams;
   const company = parseCompanies(params.company);
   const kind = parseKind(params.kind);
   const from = parseDate(params.from);
   const to = parseDate(params.to);
+  const cursor = parseCursor(params.cursor);
 
-  // The carousel is deliberately unfiltered — a fixed "most active right
-  // now" spotlight, not something that should shrink to whatever's
-  // currently filtered in the grid below. Reused as the grid's own data
-  // when no filter is active, since it'd otherwise be an identical fetch.
-  const unfiltered = await getCompanyHighlights(undefined, undefined, undefined, undefined);
-  const highlights =
-    company || kind || from || to
-      ? await getCompanyHighlights(company, kind, from, to)
-      : unfiltered;
+  const [carouselHighlights, { items, nextCursor }] = await Promise.all([
+    getCarouselHighlights(),
+    getFeed(company, kind, from, to, cursor),
+  ]);
 
   return (
     <div className="flex flex-1 flex-col">
       <StockTicker />
       <Hero />
       <MenuBar />
-      <CompanyCarousel highlights={unfiltered.slice(0, CAROUSEL_SIZE)} />
+      <CompanyCarousel highlights={carouselHighlights.slice(0, CAROUSEL_SIZE)} />
       <main className="flex w-full flex-1 flex-col gap-6 px-6 py-6 lg:flex-row lg:gap-8">
         <FilterSidebar />
 
         <div className="max-w-5xl flex-1">
-          {highlights.length === 0 ? (
-            <EmptyState />
-          ) : (
-            <div className="grid gap-4 sm:grid-cols-2">
-              {highlights.map(({ company, article }) => (
-                <CompanyHighlightCard key={article.article_hash} company={company} article={article} />
-              ))}
-            </div>
-          )}
+          <ArticleFeed
+            key={`${company?.join(",") ?? ""}|${kind ?? ""}|${from ?? ""}|${to ?? ""}|${cursor ?? ""}`}
+            initialItems={items}
+            initialCursor={nextCursor}
+            kind={kind}
+          />
         </div>
       </main>
-    </div>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border py-24 text-center">
-      <svg viewBox="0 0 24 24" className="size-10 text-muted-foreground" aria-hidden="true">
-        <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeOpacity="0.4" strokeWidth="1.5" />
-        <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" strokeOpacity="0.4" strokeWidth="1.5" />
-      </svg>
-      <p className="font-medium text-foreground">Nothing on the radar yet</p>
-      <p className="max-w-sm text-sm text-muted-foreground">
-        No articles match this filter. Try clearing it or checking back after the next scan.
-      </p>
     </div>
   );
 }

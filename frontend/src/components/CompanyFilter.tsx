@@ -41,6 +41,9 @@ export function CompanyFilter() {
     if (watchlist.length === 0) return;
     const params = new URLSearchParams(searchParams.toString());
     params.set("company", watchlist.join(","));
+    // See applySelection's comment — a cursor from a different filter
+    // combination is an invalid ExclusiveStartKey for this one.
+    params.delete("cursor");
     router.replace(`${pathname}?${params}`, { scroll: false });
   }, [searchParams, pathname, router]);
 
@@ -66,6 +69,12 @@ export function CompanyFilter() {
     } else {
       params.delete("company");
     }
+    // A cursor encodes a pagination position for one specific query shape
+    // (which index, which filters) — carrying it into a different filter
+    // combination sends DynamoDB an ExclusiveStartKey that doesn't match
+    // the index actually being queried, which the read API can't recover
+    // from (500, not just wrong results).
+    params.delete("cursor");
     router.push(`${pathname}${params.size ? `?${params}` : ""}`, { scroll: false });
   }
 
