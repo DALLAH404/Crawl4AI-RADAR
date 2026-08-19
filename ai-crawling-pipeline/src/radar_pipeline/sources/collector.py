@@ -135,11 +135,10 @@ async def _fetch_items(
         if gnews is None:
             raise FeedFetchError("GNews collector is not configured", url=_feed_url(source))
         query = source["query_text"] or source["tag"] or source["name"]
-        # Keep enough entries for either normal mode or backfill; the caller
-        # applies the mode-specific limit after the feed has been fetched.
-        max_items = max(config.max_items_per_feed, config.backfill_max_items)
         try:
-            items = await gnews.search(query, max_items=max_items)
+            url = gnews.build_search_url(query)
+            raw_xml = await gnews.fetch_rss(url)
+            items = gnews.parse_rss(raw_xml)
             return [item.to_feed_item() for item in items]
         except HostBlockedError as exc:
             raise FeedFetchError(f"host blocked: {exc.host}", url=_feed_url(source)) from exc
@@ -389,7 +388,7 @@ async def collect_once(store, sources: list, config, mode: str = "normal") -> Co
             )
             gnews = GNewsCollector(
                 GNewsConfig(
-                    max_items_per_query=max(config.max_items_per_feed, config.backfill_max_items),
+                    max_items_per_query=2,
                     request_timeout=30.0,
                     resolve_concurrency=max(1, int(config.gnews_concurrency)),
                     resolve_max_retries=max(1, int(config.fetch_max_retries)),
