@@ -29,7 +29,7 @@ import feedparser
 import httpx
 from googlenewsdecoder import gnewsdecoder
 
-from radar_pipeline.sources.feedparser import fetch_and_parse
+from radar_pipeline.sources.feedparser import FeedFetchError
 from radar_pipeline.sources.ratelimit import HostBlockedError, RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,7 @@ class GNewsConfig:
     hl: str = "pt-BR"
     gl: str = "BR"
     ceid: str = "BR:pt-419"
-    max_items_per_query: int = 25
+    max_items_per_query: int = 2
     request_timeout: float = 30.0
     resolve_concurrency: int = 5
     resolve_interval: float = 1.0
@@ -222,6 +222,80 @@ class GNewsCollector:
             )
         return self.client
 
+    async def _fetch_text(self, url: str) -> str:
+        """Limiter-aware GET returning the raw response body as text."""
+        client = self._require_client()
+        limiter = self.limiter
+        acquired = False
+        if limiter is not None:
+            if await limiter.is_blocked(url):
+                raise FeedFetchError(
+                    f"host blocked: {limiter.host_for(url)}", url=url,
+                )
+            try:
+                await limiter.acquire(url)
+                acquired = True
+            except HostBlockedError as exc:
+                raise FeedFetchError(f"host blocked: {exc.host}", url=url) from exc
+
+        try:
+            try:
+                resp = await client.get(
+                    url,
+                    headers={"User-Agent": self.cfg.user_agent},
+                    follow_redirects=True,
+                )
+            except httpx.HTTPError as exc:
+                if limiter is not None:
+                    limiter.record_failure(url)
+                raise FeedFetchError(f"HTTP error: {exc}", url=url) from exc
+
+            if resp.status_code == 200:
+                if limiter is not None:
+                    limiter.record_success(url)
+                return resp.text
+
+            retry_after = None
+            raw_retry_after = resp.headers.get("retry-after")
+            if raw_retry_after:
+                try:
+                    retry_after = float(raw_retry_after)
+                except ValueError:
+                    retry_after = None
+            if limiter is not None:
+                limiter.record_failure(
+                    url, status=resp.status_code, retry_after=retry_after,
+                )
+            raise FeedFetchError(
+                f"HTTP {resp.status_code}",
+                status_code=resp.status_code,
+                url=url,
+            )
+        finally:
+            if acquired and limiter is not None:
+                limiter.release(url)
+
+    async def fetch_rss(self, url: str) -> str:
+        """Fetch the raw Google News RSS/XML body for ``url``."""
+        return await self._fetch_text(url)
+
+    async def fetch_html(self, url: str) -> str:
+        """Fetch the raw publisher HTML body for ``url``."""
+        return await self._fetch_text(url)
+
+    def parse_rss(
+        self,
+        raw_xml: str,
+        max_items: Optional[int] = None,
+        min_date: Optional[datetime] = None,
+    ) -> list[GNewsItem]:
+        """Parse an RSS/XML body into GNewsItem objects."""
+        return self._items_from_feed_text(
+            raw_xml,
+            max_items=max_items or self.cfg.max_items_per_query,
+            min_date=min_date,
+        )
+
     def build_search_url(self, query: str, when_days: Optional[int] = None) -> str:
         q = query if not (when_days and when_days > 0) else f"{query} when:{when_days}d"
         return (
@@ -238,26 +312,9 @@ class GNewsCollector:
         min_date: Optional[datetime] = None,
     ) -> list[GNewsItem]:
         """Fetch and parse RSS without resolving article links."""
-        client = self._require_client()
         url = self.build_search_url(query, when_days)
-        feed_items = await fetch_and_parse(
-            url,
-            client,
-            limiter=self.limiter,
-            user_agent=self.cfg.user_agent,
-            max_retries=self.cfg.search_max_retries,
-            backoff_seconds=self.cfg.search_backoff_seconds,
-            timeout_seconds=self.cfg.request_timeout,
-        )
-
-        limit = max_items or self.cfg.max_items_per_query
-        result = [GNewsItem.from_feed_item(item) for item in feed_items[:limit]]
-        if min_date is not None:
-            result = [
-                item for item in result
-                if item.published is None or item.published >= min_date
-            ]
-        return result
+        raw_xml = await self.fetch_rss(url)
+        return self.parse_rss(raw_xml, max_items=max_items, min_date=min_date)
 
     async def search_many(
         self,
