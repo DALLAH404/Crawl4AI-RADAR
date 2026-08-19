@@ -243,6 +243,7 @@ def _base_item(article: Article) -> dict:
         "alert_level": article.alert_level,
         "is_launch": bool(article.is_launch),
         "image_url": article.image_url,
+        "image_urls": article.image_urls or None,
         "link": article.link,
         "raw_link": article.raw_link,
         "ingestion_batch_id": article.ingestion_batch_id,
@@ -302,6 +303,11 @@ def _company_item(article: Article, tag: str) -> dict:
         "action_description": article.action_description,
         "link": article.link,
         "image_url": article.image_url,
+        # Denormalized the same way as the other fields on this item — see
+        # dedup_decision's comment just below — so a multi-image post still
+        # shows every photo when reached via a company-filtered read, not
+        # just via the base item.
+        "image_urls": article.image_urls or None,
         "category": article.category,
         "event_type": article.event_type,
         "alert_level": article.alert_level,

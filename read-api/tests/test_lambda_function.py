@@ -146,10 +146,26 @@ class TestLatestArticles:
         assert "dedup_reason" not in article
         assert "raw_link" not in article
         assert set(article) == {
-            "article_hash", "title", "link", "image_url", "summary", "action_description",
+            "article_hash", "title", "link", "image_url", "image_urls", "summary", "action_description",
             "competitor_analysis", "category", "content_kind", "event_type",
             "alert_level", "summary_status", "published_at", "companies", "source_name",
         }
+
+    def test_image_urls_passes_through_when_present(self, table):
+        _put_base_item(
+            table, article_hash="multi", published_at="2026-08-01",
+            image_url="https://example.com/1.jpg",
+            image_urls=["https://example.com/1.jpg", "https://example.com/2.jpg"],
+        )
+        body = json.loads(lf.handler(_event({}), None)["body"])
+        assert body["items"][0]["image_urls"] == [
+            "https://example.com/1.jpg", "https://example.com/2.jpg",
+        ]
+
+    def test_image_urls_falls_back_to_single_image_url(self, table):
+        _put_base_item(table, article_hash="single", published_at="2026-08-01", image_url="https://example.com/1.jpg")
+        body = json.loads(lf.handler(_event({}), None)["body"])
+        assert body["items"][0]["image_urls"] == ["https://example.com/1.jpg"]
 
     def test_pagination_cursor_advances(self, table):
         for i in range(3):

@@ -81,6 +81,7 @@ not approximate, in all three cases. Only the multi-company fan-out has the
       "title": "…",
       "link": "…",
       "image_url": "…",
+      "image_urls": ["…"],
       "summary": "…",
       "competitor_analysis": "…",
       "category": "auto",

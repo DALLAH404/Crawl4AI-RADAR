@@ -44,6 +44,10 @@ POST_IMAGE_RE = re.compile(r'<img[^>]+src="(https://media\.licdn\.com/dms/image/
 # Video posts render as <video poster="..." data-sources="[...mp4 urls...]">
 # rather than <img>, so they need a separate pattern entirely.
 POST_VIDEO_RE = re.compile(r'<video\b[^>]*>')
+# The stable numeric ID embedded in every post URL — used to locate a post's
+# href in the media fetch's HTML even when the surrounding URL differs (see
+# _href_pattern below).
+ACTIVITY_ID_RE = re.compile(r'-activity-(\d+)')
 
 # Approximate day-equivalents for LinkedIn's relative-time units. Minutes
 # ("21m") were missing entirely in an earlier version, which silently
@@ -164,6 +168,23 @@ def extract_video_sources(video_tag: str) -> dict | None:
     }
 
 
+def _href_pattern(url: str) -> re.Pattern[str]:
+    # The text fetch and the media fetch (_fetch_company_page vs
+    # _fetch_page_images) are two independent browser sessions loading the
+    # same feed at different moments — a post's href can pick up different
+    # tracking query params between the two, so an exact-URL match can miss
+    # a post entirely even though it's right there in the HTML (silently
+    # zeroing out its images/videos, see extract_post_media's caller).
+    # Anchor on the stable numeric activity ID instead, still scoped to an
+    # href attribute (not just anywhere in the page — see extract_post_media
+    # below for why that scoping matters). Falls back to the old exact-URL
+    # match for the rare post URL with no activity ID in it.
+    m = ACTIVITY_ID_RE.search(url)
+    if not m:
+        return re.compile(re.escape(f'href="{url}"'))
+    return re.compile(r'href="[^"]*-activity-' + re.escape(m.group(1)) + r'[^"]*"')
+
+
 def extract_post_media(page_html: str, post_urls: list[str]) -> dict[str, dict]:
     # Match each post to the photo(s)/video(s) between its link and the next
     # post's link in the raw HTML (DOM order == feed order). Must search for
@@ -172,9 +193,11 @@ def extract_post_media(page_html: str, post_urls: list[str]) -> dict[str, dict]:
     # which would give a false/earlier position if matched loosely.
     positions = []
     for url in post_urls:
-        m = re.search(re.escape(f'href="{url}"'), page_html)
+        m = _href_pattern(url).search(page_html)
         if m:
             positions.append((m.start(), url))
+        else:
+            logger.warning("LinkedIn: post href not found in media fetch, no images/videos: %s", url)
     positions.sort()
 
     img_positions = [(m.start(), html.unescape(m.group(1))) for m in POST_IMAGE_RE.finditer(page_html)]
@@ -341,6 +364,10 @@ def _to_item(slug: str, post: dict) -> dict[str, Any]:
         "published_at": post["estimated_date"] or "",
         "summary_text": text[:300],
         "image_url": _post_image_url(post),
+        # Full ordered image list (card/feed still only ever show image_url,
+        # the first one) — the article detail page uses this to show every
+        # photo in a multi-image carousel post.
+        "image_urls": post.get("images", []),
         "action_description": text,
         "extra": json.dumps(extra, ensure_ascii=False),
     }

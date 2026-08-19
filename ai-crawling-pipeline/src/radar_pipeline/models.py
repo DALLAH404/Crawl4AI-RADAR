@@ -63,6 +63,11 @@ class Article:
     alert_level: str = "Baixo"
     is_launch: bool = False
     image_url: str = ""
+    # Full ordered image list — only ever more than one item for a LinkedIn
+    # carousel post (see sources/linkedin.py's _to_item); every other source
+    # has at most one image and leaves this empty, with image_url as the
+    # single source of truth.
+    image_urls: list[str] = field(default_factory=list)
     link: str = ""
     raw_link: str = ""
     ingestion_batch_id: str = ""

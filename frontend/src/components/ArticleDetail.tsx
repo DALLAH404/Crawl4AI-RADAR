@@ -74,6 +74,16 @@ export function ArticleDetail({ hash }: { hash: string }) {
   const displayText =
     article.summary || cleanScrapedText(article.title) || cleanScrapedText(article.action_description);
 
+  // article.image_urls may be missing on a bookmark saved before this field
+  // existed — bookmarks are durable raw JSON in localStorage (lib/bookmarks.ts),
+  // not re-fetched from the API, so old entries keep whatever shape they were
+  // saved with.
+  const images = article.image_urls?.length
+    ? article.image_urls
+    : article.image_url
+      ? [article.image_url]
+      : [];
+
   return (
     <article className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
@@ -87,15 +97,21 @@ export function ArticleDetail({ hash }: { hash: string }) {
         <BookmarkButton article={article} />
       </div>
 
-      {(article.image_url || article.companies[0]) && (
-        <div className="aspect-[16/9] w-full overflow-hidden rounded-xl bg-muted">
-          {article.image_url ? (
-            // eslint-disable-next-line @next/next/no-img-element -- external, unpredictable source hosts
-            <img src={article.image_url} alt="" className="size-full object-contain" />
-          ) : (
-            <CompanyLogoFallback company={article.companies[0]} />
-          )}
+      {images.length > 0 ? (
+        <div className="flex flex-col gap-2">
+          {images.map((url) => (
+            <div key={url} className="aspect-[16/9] w-full overflow-hidden rounded-xl bg-muted">
+              {/* eslint-disable-next-line @next/next/no-img-element -- external, unpredictable source hosts */}
+              <img src={url} alt="" className="size-full object-contain" />
+            </div>
+          ))}
         </div>
+      ) : (
+        article.companies[0] && (
+          <div className="aspect-[16/9] w-full overflow-hidden rounded-xl bg-muted">
+            <CompanyLogoFallback company={article.companies[0]} />
+          </div>
+        )
       )}
 
       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">

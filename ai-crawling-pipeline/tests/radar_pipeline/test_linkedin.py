@@ -135,6 +135,42 @@ class TestExtractPostMedia:
         media = extract_post_media("<p>nothing here</p>", ["https://www.linkedin.com/posts/x_1"])
         assert media == {"https://www.linkedin.com/posts/x_1": {"images": [], "videos": []}}
 
+    def test_matches_href_with_different_tracking_params(self):
+        # The text fetch and the media fetch are two independent page loads —
+        # a post's href can pick up different tracking query params between
+        # them even though it's the same post (same activity ID). Before the
+        # fix, this exact scenario silently zeroed out the post's media.
+        post_url = "https://www.linkedin.com/posts/schaeffler_foo-activity-7493290212643610625-d-lf"
+        href_in_page = (
+            "https://www.linkedin.com/posts/schaeffler_foo-activity-7493290212643610625-d-lf"
+            "?utm_source=share&trackingId=someOtherValue%3D%3D"
+        )
+        page_html = (
+            f'<div><a href="{href_in_page}">post</a></div>'
+            '<img src="https://media.licdn.com/dms/image/abc/image-shrink_800/1.jpg">'
+        )
+
+        media = extract_post_media(page_html, [post_url])
+
+        assert media[post_url]["images"] == [
+            "https://media.licdn.com/dms/image/abc/image-shrink_800/1.jpg"
+        ]
+
+    def test_multi_image_carousel_post_keeps_every_image(self):
+        url = "https://www.linkedin.com/posts/schaeffler_activity-111"
+        page_html = (
+            f'<div><a href="{url}">post</a></div>'
+            '<img src="https://media.licdn.com/dms/image/a/image-shrink_800/1.jpg">'
+            '<img src="https://media.licdn.com/dms/image/a/image-shrink_800/2.jpg">'
+        )
+
+        media = extract_post_media(page_html, [url])
+
+        assert media[url]["images"] == [
+            "https://media.licdn.com/dms/image/a/image-shrink_800/1.jpg",
+            "https://media.licdn.com/dms/image/a/image-shrink_800/2.jpg",
+        ]
+
 
 class FakeResult:
     def __init__(self, success=True, status_code=200, url="https://www.linkedin.com/company/bosch/", markdown=""):
@@ -208,9 +244,29 @@ class TestItemMapping:
         assert item["action_description"] == post["text"]
         assert item["summary_text"] == post["text"][:300]
         assert item["image_url"] == ""
+        assert item["image_urls"] == []
 
         import json
         extra = json.loads(item["extra"])
         assert extra["linkedin_slug"] == "bosch"
         assert extra["reactions"] == 10
         assert extra["comments"] == 2
+
+    def test_to_item_image_urls_keeps_every_image(self):
+        post = {
+            "url": "https://www.linkedin.com/posts/bosch_activity-1",
+            "text": "Bosch launches a carousel post.",
+            "relative_time": "3d",
+            "edited": False,
+            "estimated_age_days": 3.0,
+            "estimated_date": "2026-08-09",
+            "reactions": 0,
+            "comments": 0,
+            "images": ["https://img.example/1.jpg", "https://img.example/2.jpg"],
+            "videos": [],
+        }
+        item = _to_item("bosch", post)
+        # Card/feed still only ever show the first image...
+        assert item["image_url"] == "https://img.example/1.jpg"
+        # ...but the full list is there for the article detail page.
+        assert item["image_urls"] == ["https://img.example/1.jpg", "https://img.example/2.jpg"]

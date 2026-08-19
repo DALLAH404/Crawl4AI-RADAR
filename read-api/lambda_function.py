@@ -102,6 +102,10 @@ def _public_article(item: dict) -> dict:
         "title": item.get("title", ""),
         "link": item.get("link", ""),
         "image_url": item.get("image_url", ""),
+        # Falls back to a single-item list built from image_url for articles
+        # written before image_urls existed, or from a source that never
+        # sets it (every non-LinkedIn source has at most one image anyway).
+        "image_urls": item.get("image_urls") or ([item["image_url"]] if item.get("image_url") else []),
         "summary": item.get("summary", ""),
         # Full scraped post text — only meaningfully "full" for social
         # (LinkedIn) sources; for RSS/news sources this is just a 300-char

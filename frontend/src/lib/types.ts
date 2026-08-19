@@ -11,6 +11,10 @@ export interface Article {
   title: string;
   link: string;
   image_url: string;
+  // Full ordered image list — more than one entry only for a LinkedIn
+  // carousel post. The feed card still only shows image_url (the first
+  // one); ArticleDetail is what shows the rest.
+  image_urls: string[];
   summary: string;
   // Full scraped post text — only meaningfully "full" for social (LinkedIn)
   // sources; for news sources it's just a short snippet, no more complete

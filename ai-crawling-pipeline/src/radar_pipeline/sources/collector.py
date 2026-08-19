@@ -274,6 +274,7 @@ async def _process_source(
                 alert_level=alert_level,
                 is_launch=is_launch,
                 image_url=item["image_url"],
+                image_urls=item.get("image_urls") or ([item["image_url"]] if item["image_url"] else []),
                 link=resolved_link,
                 raw_link=raw_link,
                 ingestion_batch_id=batch_id,
