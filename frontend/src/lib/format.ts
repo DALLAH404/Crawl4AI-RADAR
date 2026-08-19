@@ -1,5 +1,12 @@
 // published_at can be a bare "YYYY-MM-DD" or a full ISO timestamp (see
 // read-api/README.md) — Date() parses both.
+//
+// timeZone: "UTC" is required, not cosmetic — without it this renders in
+// the runtime's local timezone, which is UTC on the server (Node) but the
+// viewer's own offset in the browser. For a published_at near midnight
+// UTC, that's a different calendar date on each side: a real server/client
+// hydration mismatch (SSR said "18 Aug", the client's first paint said "19
+// Aug"), not just a display preference.
 export function formatDate(published_at: string): string {
   if (!published_at) return "";
   const date = new Date(published_at);
@@ -8,6 +15,7 @@ export function formatDate(published_at: string): string {
     day: "numeric",
     month: "short",
     year: "numeric",
+    timeZone: "UTC",
   });
 }
 
