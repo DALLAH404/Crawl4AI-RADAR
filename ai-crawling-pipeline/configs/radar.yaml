@@ -16,11 +16,19 @@ collect:
   backfill_max_items: 100
   days_back: 30
   backfill_days: 90
-  # Cutoff for a normal-mode --collect run. Set for the every-3-hours
-  # schedule (Phase 4) so each run only looks back as far as the last one;
-  # leave unset to fall back to days_back. --backfill ignores this and uses
-  # backfill_days instead, for a manual wide-range catch-up run.
-  hours_back: 3
+  # Cutoff for a normal-mode --collect run; leave unset to fall back to
+  # days_back. --backfill ignores this and uses backfill_days instead, for a
+  # manual wide-range catch-up run.
+  #
+  # Deliberately much wider than the every-3-hours schedule (Phase 4) rather
+  # than matched to it. A window that only reaches back to the last run has
+  # no slack: one delayed or failed run loses those articles permanently.
+  # It also assumes each 3h slice actually contains news — measured against
+  # the real source list, zero articles are published in a given 3h window,
+  # so a 3h cutoff discarded essentially everything. The overlap this
+  # creates is close to free: find_by_raw_link dedups on the raw link before
+  # any resolver round-trip, so re-seeing an article costs one DB read.
+  hours_back: 24
   # Which sources' `tag` to poll this run. Empty = every active source.
   # Override per-run with `--companies bosch,valeo` without editing the file.
   companies: []

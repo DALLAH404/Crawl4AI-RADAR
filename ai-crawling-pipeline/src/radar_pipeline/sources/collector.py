@@ -100,6 +100,23 @@ def _build_limiter(config) -> RateLimiter:
     )
 
 
+def _collect_cutoff(config, mode: str) -> datetime:
+    """The oldest ``published_at`` this run should keep. Shared by
+    _process_source's own date filter (every source type) and, for
+    google_news_query sources, passed into gnews.parse_rss_detailed as
+    min_date — Google's feed is relevance- not date-ordered, so filtering
+    only after the collector's own max_items_per_query cap discards fresh
+    articles that happened to rank low and keeps stale ones that ranked
+    high (see gnews.py's _items_and_stats docstring)."""
+    if mode == "backfill":
+        window = timedelta(days=config.backfill_days)
+    elif config.hours_back is not None:
+        window = timedelta(hours=config.hours_back)
+    else:
+        window = timedelta(days=config.days_back)
+    return datetime.now(timezone.utc) - window
+
+
 def _build_linkedin_limiter(config) -> RateLimiter:
     li = config.linkedin
     return RateLimiter(
@@ -115,6 +132,7 @@ async def _fetch_items(
     client: httpx.AsyncClient,
     limiter: RateLimiter,
     config,
+    mode: str,
     gnews: GNewsCollector | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch raw items for a source, in the ``feedparser`` item shape.
@@ -138,7 +156,16 @@ async def _fetch_items(
         try:
             url = gnews.build_search_url(query)
             raw_xml = await gnews.fetch_rss(url)
-            items = gnews.parse_rss(raw_xml)
+            cutoff = _collect_cutoff(config, mode)
+            items, feed_stats = gnews.parse_rss_detailed(raw_xml, min_date=cutoff)
+            # The line the 50-entries-truncated-to-2 regression was missing
+            # entirely — items_found (below, in _process_source) only ever
+            # sees the post-truncation count, so this is the only place the
+            # truncation itself is visible at all.
+            logger.info(
+                "GNews feed for %s: %d entries -> %d in window -> %d kept",
+                source["name"], feed_stats["total"], feed_stats["in_window"], feed_stats["kept"],
+            )
             return [item.to_feed_item() for item in items]
         except HostBlockedError as exc:
             raise FeedFetchError(f"host blocked: {exc.host}", url=_feed_url(source)) from exc
@@ -186,20 +213,21 @@ async def _process_source(
     is_linkedin = source["feed_type"] == "linkedin_company"
 
     try:
-        items = await _fetch_items(source, client, limiter, config, gnews)
+        items = await _fetch_items(source, client, limiter, config, mode, gnews)
 
         run.items_found = len(items)
 
         max_items = config.backfill_max_items if mode == "backfill" else config.max_items_per_feed
         items = items[:max_items]
 
-        if mode == "backfill":
-            window = timedelta(days=config.backfill_days)
-        elif config.hours_back is not None:
-            window = timedelta(hours=config.hours_back)
-        else:
-            window = timedelta(days=config.days_back)
-        cutoff = datetime.now(timezone.utc) - window
+        cutoff = _collect_cutoff(config, mode)
+
+        # Per-source drop counters — every one of these used to be a bare
+        # `continue`, indistinguishable from each other and from a
+        # perfectly healthy run once summarized as items_found - items_new.
+        dropped_cutoff = 0
+        dropped_scope = 0
+        dropped_raw_dedup = 0
 
         candidates: list[dict[str, Any]] = []
         for item in items:
@@ -207,12 +235,14 @@ async def _process_source(
                 try:
                     pub_dt = datetime.fromisoformat(item["published_at"])
                     if pub_dt < cutoff:
+                        dropped_cutoff += 1
                         continue
                 except (ValueError, TypeError):
                     pass
 
             text = f"{item['title']} {item['summary_text']}"
             if eh_fora_de_escopo(text):
+                dropped_scope += 1
                 continue
 
             # Fast-path dedup on the unresolved (raw) link — saves a
@@ -223,6 +253,7 @@ async def _process_source(
             raw_link = item["link"]
             existing_raw = find_by_raw_link(store, raw_link)
             if existing_raw is not None:
+                dropped_raw_dedup += 1
                 continue
 
             candidates.append(item)
@@ -234,8 +265,11 @@ async def _process_source(
         await gnews.resolve_all(resolved_items) if gnews is not None else None
 
         new_count = 0
+        dropped_unresolved = 0
+        dropped_hash_dedup = 0
         for item, resolved_item in zip(candidates, resolved_items):
             if resolved_item.resolve_status == "failed":
+                dropped_unresolved += 1
                 logger.warning(
                     "dropping unresolved GNews item for %s: %s",
                     source["name"],
@@ -250,6 +284,7 @@ async def _process_source(
 
             existing = find_by_article_hash(store, article_hash)
             if existing is not None:
+                dropped_hash_dedup += 1
                 continue
 
             title = item["title"] or (f"{source['name']} LinkedIn post" if is_linkedin else "")
@@ -288,7 +323,14 @@ async def _process_source(
                 new_count += 1
 
         run.items_new = new_count
+        run.items_duplicate = dropped_raw_dedup + dropped_hash_dedup
         run.status = "ok"
+        logger.info(
+            "collected %s: found=%d new=%d duplicate=%d out_of_window=%d "
+            "out_of_scope=%d unresolved=%d",
+            source["name"], run.items_found, new_count, run.items_duplicate,
+            dropped_cutoff, dropped_scope, dropped_unresolved,
+        )
     except FeedFetchError as exc:
         run.status = "error"
         run.error_message = f"HTTP {exc.status_code}" if exc.status_code else str(exc)
@@ -329,6 +371,7 @@ def _reduce_results(
             stats.sources_ok += 1
             stats.items_found += run.items_found
             stats.items_new += run.items_new
+            stats.items_duplicate += run.items_duplicate
         else:
             stats.sources_error += 1
             stats.errors.append({

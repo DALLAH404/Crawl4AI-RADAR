@@ -29,7 +29,7 @@ import feedparser
 import httpx
 from googlenewsdecoder import gnewsdecoder
 
-from radar_pipeline.sources.feedparser import FeedFetchError
+from radar_pipeline.sources.feedparser import FeedFetchError, _retry_after_seconds
 from radar_pipeline.sources.ratelimit import HostBlockedError, RateLimiter
 
 logger = logging.getLogger(__name__)
@@ -128,6 +128,9 @@ class GNewsItem:
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
+# Sort-key stand-in for an undated entry — always the oldest possible value,
+# so undated items sort after every dated one (see _items_and_stats).
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _clean_html(value: str) -> str:
@@ -223,7 +226,19 @@ class GNewsCollector:
         return self.client
 
     async def _fetch_text(self, url: str) -> str:
-        """Limiter-aware GET returning the raw response body as text."""
+        """Limiter-aware GET returning the raw response body as text.
+
+        Retries on a network error or a 429/5xx, up to search_max_retries —
+        the same knobs (fetch_max_retries/fetch_backoff_seconds) the old
+        search() got via fetch_and_parse (see collector.py's GNewsConfig
+        construction). Without this, a single transient 429 from Google News
+        used to just fail one retry attempt; here it fails the whole source
+        for the run. The limiter is held across the retries (acquired once,
+        released in `finally`), matching fetch_and_parse's own pattern for
+        this exact host — the point of gnews_concurrency is to cap in-flight
+        requests to news.google.com, which should include one that's
+        currently backing off, not just ones about to send.
+        """
         client = self._require_client()
         limiter = self.limiter
         acquired = False
@@ -238,39 +253,58 @@ class GNewsCollector:
             except HostBlockedError as exc:
                 raise FeedFetchError(f"host blocked: {exc.host}", url=url) from exc
 
+        max_retries = max(0, self.cfg.search_max_retries)
+        backoff_seconds = max(0.0, self.cfg.search_backoff_seconds)
+        last_resp: Optional[httpx.Response] = None
+
         try:
-            try:
-                resp = await client.get(
-                    url,
-                    headers={"User-Agent": self.cfg.user_agent},
-                    follow_redirects=True,
-                )
-            except httpx.HTTPError as exc:
-                if limiter is not None:
-                    limiter.record_failure(url)
-                raise FeedFetchError(f"HTTP error: {exc}", url=url) from exc
-
-            if resp.status_code == 200:
-                if limiter is not None:
-                    limiter.record_success(url)
-                return resp.text
-
-            retry_after = None
-            raw_retry_after = resp.headers.get("retry-after")
-            if raw_retry_after:
+            for attempt in range(max_retries + 1):
                 try:
-                    retry_after = float(raw_retry_after)
-                except ValueError:
-                    retry_after = None
-            if limiter is not None:
-                limiter.record_failure(
-                    url, status=resp.status_code, retry_after=retry_after,
-                )
-            raise FeedFetchError(
-                f"HTTP {resp.status_code}",
-                status_code=resp.status_code,
-                url=url,
-            )
+                    resp = await client.get(
+                        url,
+                        headers={"User-Agent": self.cfg.user_agent},
+                        follow_redirects=True,
+                    )
+                except httpx.HTTPError as exc:
+                    if limiter is not None:
+                        limiter.record_failure(url)
+                    if attempt >= max_retries:
+                        raise FeedFetchError(f"HTTP error: {exc}", url=url) from exc
+                else:
+                    last_resp = resp
+                    if resp.status_code == 200:
+                        if limiter is not None:
+                            limiter.record_success(url)
+                        return resp.text
+
+                    retry_after = _retry_after_seconds(resp)
+                    if limiter is not None:
+                        limiter.record_failure(
+                            url, status=resp.status_code, retry_after=retry_after,
+                        )
+
+                    retryable = resp.status_code == 429 or 500 <= resp.status_code < 600
+                    if not retryable:
+                        raise FeedFetchError(
+                            f"HTTP {resp.status_code}",
+                            status_code=resp.status_code,
+                            url=url,
+                        )
+                    if attempt >= max_retries:
+                        raise FeedFetchError(
+                            f"HTTP {resp.status_code} after {max_retries} retries",
+                            status_code=resp.status_code,
+                            url=url,
+                        )
+
+                retry_after = _retry_after_seconds(last_resp) if last_resp is not None else None
+                sleep_for = retry_after if retry_after is not None else backoff_seconds * (2 ** attempt)
+                sleep_for += random.uniform(0.0, min(0.5, sleep_for))
+                await asyncio.sleep(sleep_for)
+
+            # Unreachable — the loop above always returns or raises on its
+            # final attempt — but keeps this an exhaustive function per mypy.
+            raise FeedFetchError("fetch exhausted retries", url=url)
         finally:
             if acquired and limiter is not None:
                 limiter.release(url)
@@ -290,9 +324,30 @@ class GNewsCollector:
         min_date: Optional[datetime] = None,
     ) -> list[GNewsItem]:
         """Parse an RSS/XML body into GNewsItem objects."""
-        return self._items_from_feed_text(
+        items, _stats = self.parse_rss_detailed(
+            raw_xml, max_items=max_items, min_date=min_date,
+        )
+        return items
+
+    def parse_rss_detailed(
+        self,
+        raw_xml: str,
+        max_items: Optional[int] = None,
+        min_date: Optional[datetime] = None,
+    ) -> tuple[list[GNewsItem], dict[str, int]]:
+        """Same as ``parse_rss``, plus funnel stats (``total`` entries in the
+        feed, how many survived the ``min_date`` filter, how many the
+        ``max_items`` cap kept) — a caller can log these to see the
+        truncation that a bare item count hides. Returned rather than stored
+        on the collector: one ``GNewsCollector`` is shared across every
+        source in a run (see collector.py), so per-call instance state would
+        race under concurrency.
+        """
+        return self._items_and_stats(
             raw_xml,
-            max_items=max_items or self.cfg.max_items_per_query,
+            # explicit falsy max_items (0) is a real request for zero items,
+            # not "unset" — only None falls back to the configured default.
+            max_items=max_items if max_items is not None else self.cfg.max_items_per_query,
             min_date=min_date,
         )
 
@@ -464,12 +519,43 @@ class GNewsCollector:
         max_items: int,
         min_date: Optional[datetime],
     ) -> list[GNewsItem]:
-        items: list[GNewsItem] = []
-        for entry in _parse_feed_text(raw_xml)[:max_items]:
+        items, _ = self._items_and_stats(
+            raw_xml, max_items=max_items, min_date=min_date,
+        )
+        return items
+
+    def _items_and_stats(
+        self,
+        raw_xml: str,
+        *,
+        max_items: int,
+        min_date: Optional[datetime],
+    ) -> tuple[list[GNewsItem], dict[str, int]]:
+        """Parse a feed, keeping the ``max_items`` *newest* in-window entries.
+
+        Order of operations matters, and it isn't the obvious one. Google
+        News search results come back ranked by relevance, NOT by date —
+        a feed's newest entry routinely sits deep in the list (measured: a
+        21h-old article at position 60 of 62, while position 2 was four
+        months old, and one feed's oldest entry dated to 2009). So
+        truncating to ``max_items`` in feed order and date-filtering the
+        survivors — which is what this did before — throws away the fresh
+        articles before the date filter ever sees them, and then drops the
+        stale ones it kept. With a small cap and a tight window that yields
+        nothing at all, from a feed that genuinely had new articles in it.
+
+        Filtering and sorting therefore both happen across the *whole* feed,
+        and the cap is applied last. The full feed already arrived in one
+        response, so this costs no extra network.
+        """
+        entries = _parse_feed_text(raw_xml)
+
+        in_window: list[GNewsItem] = []
+        for entry in entries:
             published = _parse_entry_date(entry)
             if min_date and published and published < min_date:
                 continue
-            items.append(
+            in_window.append(
                 GNewsItem(
                     title=(entry.get("title") or "").strip(),
                     google_link=(entry.get("link") or "").strip(),
@@ -478,7 +564,23 @@ class GNewsCollector:
                     summary=_clean_html(entry.get("summary", "")),
                 )
             )
-        return items
+
+        # Undated entries are kept (the collect stage keeps items with an
+        # empty published_at too, rather than guessing), but they sort last
+        # so a dated, genuinely-fresh article always wins a capped slot over
+        # one whose date we simply couldn't read.
+        in_window.sort(
+            key=lambda item: (item.published is not None, item.published or _EPOCH),
+            reverse=True,
+        )
+
+        kept = in_window[:max_items]
+        stats = {
+            "total": len(entries),
+            "in_window": len(in_window),
+            "kept": len(kept),
+        }
+        return kept, stats
 
 
 async def resolve_google_news_url(

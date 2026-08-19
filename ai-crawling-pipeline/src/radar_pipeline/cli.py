@@ -52,7 +52,8 @@ def cmd_collect(store, config, metrics: MetricsCollector, mode: str = "normal") 
             print(f"  error: {e['source']}: {e['error']}")
     print(
         f"Done: {stats.sources_ok} sources OK, {stats.sources_error} errors, "
-        f"{stats.items_found} items found, {stats.items_new} new"
+        f"{stats.items_found} items found, {stats.items_new} new, "
+        f"{stats.items_duplicate} duplicate"
     )
 
 

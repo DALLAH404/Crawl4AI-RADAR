@@ -106,6 +106,10 @@ class CollectionRun:
     status: str = "ok"
     items_found: int = 0
     items_new: int = 0
+    # Raw-link + article-hash dedup hits (collector.py's two continue paths)
+    # — surfaced so CollectionStats.items_duplicate is actually populated
+    # instead of items_found - items_new being the only, unattributed clue.
+    items_duplicate: int = 0
     duration_ms: int = 0
     error_message: str = ""
 
