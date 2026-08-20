@@ -1,14 +1,14 @@
-"""Async OpenAI-compatible client wrapper for summarization."""
+"""Async LiteLLM-proxy client wrapper for summarization."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 
-from openai import APIError, APIConnectionError, AsyncOpenAI
+from litellm.exceptions import APIConnectionError, APIError
 
 from radar_pipeline.config import LLMSettings
+from radar_pipeline.llm.ai4all_litellm import AI4ALLLiteLlm
 from radar_pipeline.models import SummarizeResult
 from radar_pipeline.summarize.schema import (
     SchemaError,
@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 BASE_DELAY = 1.0
+
+_clients: dict[str, AI4ALLLiteLlm] = {}
+
+
+def _get_client(model: str) -> AI4ALLLiteLlm:
+    client = _clients.get(model)
+    if client is None:
+        client = AI4ALLLiteLlm(model=model)
+        _clients[model] = client
+    return client
 
 
 async def summarize_one(
@@ -37,17 +47,13 @@ async def summarize_one(
         {"role": "user", "content": f"Title: {title}\n\nContent:\n{content}"},
     ]
 
-    client = AsyncOpenAI(
-        base_url=llm_settings.base_url,
-        api_key=os.environ.get(llm_settings.api_key_env) or "",
-    )
+    client = _get_client(llm_settings.model)
 
     last_error = ""
     for attempt in range(MAX_RETRIES):
         try:
-            resp = await client.chat.completions.create(
-                model=llm_settings.model,
-                messages=messages,
+            resp = await client.acomplete(
+                messages,
                 temperature=llm_settings.temperature,
                 max_tokens=llm_settings.max_tokens,
                 response_format={"type": "json_object"},

@@ -420,7 +420,7 @@ addition (`content_kind: social`), not a code change to that inference rule.
 | Variable        | Used by                                  |
 |-----------------|------------------------------------------|
 | `GEMINI_API_KEY`| `GeminiEmbedder` (Layer 3, currently unused). |
-| `OPENAI_API_KEY`| `summarize/client.AsyncOpenAI` and `dedup/judge.judge` (Layer 4, currently unused) — name comes from `summarize.llm.api_key_env`/`dedup.judge_llm.api_key_env` in `configs/radar.yaml`, not hardcoded; must be a key issued by whichever provider `base_url` actually points at (an OpenCode Zen key, currently — see the "Environment variables" note in Phase 3 of `DEPLOYMENT.md`), not just any OpenAI-shaped key. |
+| `OPENAI_API_KEY`| `dedup/judge.judge` only (Layer 4, currently unused) — name comes from `dedup.judge_llm.api_key_env` in `configs/radar.yaml`, not hardcoded; must be a key issued by whichever provider `base_url` actually points at (an OpenCode Zen key, currently — see the "Environment variables" note in Phase 3 of `DEPLOYMENT.md`), not just any OpenAI-shaped key. `summarize/client.py` no longer uses this — it talks to the internal LiteLLM proxy via `llm/ai4all_litellm.AI4ALLLiteLlm`, which self-authenticates by fetching a proxy key and a GCP service-account ID token from AWS Secrets Manager (`litellm-api-key`, `gcp-service-account-credentials` in `eu-west-1`); the deployment's IAM role needs `secretsmanager:GetSecretValue` on both. |
 | `RADAR_TABLE_NAME` | Overrides `db.table_name` — set per environment via the task definition without rebuilding the image. |
 | `RADAR_FETCH_S3_BUCKET` | Overrides `fetch.s3.bucket` the same way; unset means whatever (if anything) `fetch.s3.bucket` says in the YAML. |
 

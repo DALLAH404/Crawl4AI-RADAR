@@ -1,7 +1,7 @@
 """Tests for summarize.client — strict JSON output contract.
 
-Uses a fake AsyncOpenAI client (no network) by monkeypatching the
-``AsyncOpenAI`` symbol inside ``radar_pipeline.summarize.client``.
+Uses a fake AI4ALLLiteLlm client (no network) by monkeypatching the
+``AI4ALLLiteLlm`` symbol inside ``radar_pipeline.summarize.client``.
 """
 from __future__ import annotations
 
@@ -15,6 +15,15 @@ from radar_pipeline.summarize.client import summarize_one
 from radar_pipeline.summarize.prompts import DEFAULT_SYSTEM_PROMPT
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+def _clear_client_cache():
+    from radar_pipeline.summarize import client as client_mod
+
+    client_mod._clients.clear()
+    yield
+    client_mod._clients.clear()
 
 
 def _llm_settings() -> LLMSettings:
@@ -31,27 +40,24 @@ def _fake_resp(content: str) -> SimpleNamespace:
     )
 
 
-class _FakeCompletions:
-    """Records kwargs passed to ``create`` and returns a queued response."""
+class _FakeClient:
+    """Records kwargs passed to ``acomplete`` and returns a queued response."""
 
     def __init__(self, next_content: str):
         self._next = next_content
         self.calls: list[dict] = []
 
-    async def create(self, **kwargs):
+    async def acomplete(self, messages, **kwargs):
         self.calls.append(kwargs)
         return _fake_resp(self._next)
 
 
 def _patch_client(next_content: str):
-    fake_completions = _FakeCompletions(next_content)
-    fake_client = SimpleNamespace(
-        chat=SimpleNamespace(completions=fake_completions)
-    )
+    fake_client = _FakeClient(next_content)
     return patch(
-        "radar_pipeline.summarize.client.AsyncOpenAI",
+        "radar_pipeline.summarize.client.AI4ALLLiteLlm",
         return_value=fake_client,
-    ), fake_completions
+    ), fake_client
 
 
 VALID_PAYLOAD = (
@@ -108,16 +114,13 @@ class TestSummarizeOneFailStop:
         assert "summary" in result.error.lower()
 
     async def test_empty_choices_marks_failed(self):
-        class _EmptyChoices:
-            async def create(self, **kwargs):  # noqa: ARG002
+        class _EmptyChoicesClient:
+            async def acomplete(self, messages, **kwargs):  # noqa: ARG002
                 return SimpleNamespace(choices=[])
 
-        fake_client = SimpleNamespace(
-            chat=SimpleNamespace(completions=_EmptyChoices())
-        )
         with patch(
-            "radar_pipeline.summarize.client.AsyncOpenAI",
-            return_value=fake_client,
+            "radar_pipeline.summarize.client.AI4ALLLiteLlm",
+            return_value=_EmptyChoicesClient(),
         ):
             result = await summarize_one(
                 title="t",
